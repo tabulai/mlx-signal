@@ -30,24 +30,24 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
 |---|---|---:|---:|---:|---:|
-| welch | 64ch × 2^20, nperseg=1024 | 489.8 ms | 27.9 ms | 24.1 ms | **17.6x / 20.4x** |
-| welch | 1ch × 2^22, nperseg=4096 | 48.2 ms | 2.1 ms | 1.3 ms | **22.7x / 37.5x** |
-| welch | 256ch × 2^16, nperseg=256 | 113.3 ms | 6.6 ms | 5.6 ms | **17.3x / 20.2x** |
-| spectrogram | 16ch × 2^20 | 68.2 ms | 8.1 ms | 5.7 ms | **8.4x / 12.0x** |
-| stft | 16ch × 2^20, nperseg=1024 | 79.0 ms | 6.8 ms | 3.3 ms | **11.6x / 23.8x** |
-| fftconvolve | 2^20 × 4097 | 11.3 ms | 0.7 ms | 0.5 ms | **17.0x / 20.7x** |
-| fftconvolve | 2^22 × 257 | 49.1 ms | 2.0 ms | 1.0 ms | **24.3x / 49.0x** |
-| oaconvolve | 2^23 × 513 | 27.0 ms | 3.6 ms | 2.6 ms | **7.4x / 10.4x** |
-| correlate (batched) | 64ch × 2^18, 4096 taps | 65.4 ms | 8.5 ms | 6.0 ms | **7.7x / 10.8x** |
-| resample_poly | 16ch, 48k→44.1k (147/160) | 120.7 ms | 6.4 ms | 4.2 ms | **18.9x / 28.9x** |
-| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.8 ms | 9.0 ms | 6.9 ms | **33.8x / 43.7x** |
-| resample (FFT) | 2^20 → 2^18 | 4.3 ms | 0.3 ms | 0.3 ms | **13.0x / 16.2x** |
-| hilbert | 2^20 | 9.8 ms | 0.7 ms | 0.5 ms | **14.2x / 19.0x** |
-| lfilter (FIR) | 64ch × 2^20, 257 taps | 1627.2 ms | 17.5 ms | 9.9 ms | **93.2x / 165.2x** |
-| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3257.7 ms | 44.9 ms | 23.8 ms | **72.5x / 137.1x** |
-| resample (FFT) >1M samples | 2^23 → ×0.75 | 67.3 ms | 64.6 ms | 63.6 ms | 1.0x¹ |
-| hilbert >1M samples | 2^23 | 103.0 ms | 178.1 ms | 177.5 ms | 0.6x¹ |
-| find_peaks | 2^23, prominence=1 | 219.7 ms | 216.2 ms | — | 1.0x² |
+| welch | 64ch × 2^20, nperseg=1024 | 482.3 ms | 18.0 ms | 13.9 ms | **26.8x / 34.7x** |
+| welch | 1ch × 2^22, nperseg=4096 | 47.6 ms | 1.8 ms | 0.8 ms | **26.7x / 57.2x** |
+| welch | 256ch × 2^16, nperseg=256 | 111.9 ms | 5.0 ms | 3.6 ms | **22.2x / 31.4x** |
+| spectrogram | 16ch × 2^20 | 67.3 ms | 7.3 ms | 3.7 ms | **9.2x / 18.1x** |
+| stft | 16ch × 2^20, nperseg=1024 | 78.3 ms | 6.1 ms | 1.8 ms | **12.9x / 44.8x** |
+| fftconvolve | 2^20 × 4097 | 11.2 ms | 1.8 ms | 1.5 ms | **6.4x / 7.5x** |
+| fftconvolve | 2^22 × 257 | 47.8 ms | 2.9 ms | 1.7 ms | **16.3x / 27.7x** |
+| oaconvolve | 2^23 × 513 | 27.4 ms | 4.0 ms | 2.7 ms | **6.8x / 10.4x** |
+| correlate (batched) | 64ch × 2^18, 4096 taps | 65.2 ms | 8.4 ms | 6.1 ms | **7.8x / 10.7x** |
+| resample_poly | 16ch, 48k→44.1k (147/160) | 120.3 ms | 6.4 ms | 4.2 ms | **18.8x / 28.3x** |
+| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 303.7 ms | 8.9 ms | 7.0 ms | **34.0x / 43.6x** |
+| resample (FFT) | 2^20 → 2^18 | 4.3 ms | 0.4 ms | 0.3 ms | **11.0x / 14.4x** |
+| hilbert | 2^20 | 9.9 ms | 0.8 ms | 0.6 ms | **12.9x / 17.9x** |
+| lfilter (FIR) | 64ch × 2^20, 257 taps | 1634.7 ms | 17.7 ms | 9.8 ms | **92.1x / 167.7x** |
+| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3271.8 ms | 44.5 ms | 23.6 ms | **73.5x / 138.5x** |
+| resample (FFT) >1M samples | 2^23 → ×0.75 | 67.1 ms | 65.7 ms | 64.2 ms | 1.0x¹ |
+| hilbert >1M samples | 2^23 | 103.3 ms | 180.4 ms | 177.3 ms | 0.6x¹ |
+| find_peaks | 2^23, prominence=1 | 218.0 ms | 217.2 ms | — | 1.0x² |
 
 ¹ MLX 0.32's Metal FFT is broken above 2^20 (see *Known limitations*); mlx-signal
 routes those transform lengths through the CPU stream for correctness. Blocked
@@ -70,11 +70,11 @@ with `pip install -e ".[bench]" && python bench/bench_cross.py`). End-to-end
 
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| welch, 64ch × 2^20 | 490 ms | **28 ms** | — | — | 133 ms | — | — |
-| stft, 16ch × 2^20 | 47 ms | 6.3 ms | 25 ms | **4.0 ms** | 44 ms | 63 ms | — |
-| fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 37 ms | 4.0 ms | 15 ms | — | — |
-| resample 48k→44.1k, 16ch × 2^20 | 120 ms | **6.3 ms**¹ | 8.7 ms¹ | 5.5 ms¹ | — | 56 ms | 52 ms |
-| causal FIR, 64ch × 2^20, 257 taps | 1597 ms | **18 ms** | 3831 ms² | 69 ms² | — | — | — |
+| welch, 64ch × 2^20 | 501 ms | **18 ms** | — | — | 137 ms | — | — |
+| stft, 16ch × 2^20 | 46 ms | 5.7 ms | 25 ms | **4.9 ms** | 46 ms | 64 ms | — |
+| fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 39 ms | 4.6 ms | 16 ms | — | — |
+| resample 48k→44.1k, 16ch × 2^20 | 122 ms | **6.6 ms**¹ | 8.7 ms¹ | 5.8 ms¹ | — | 56 ms | 53 ms |
+| causal FIR, 64ch × 2^20, 257 taps | 1633 ms | **17 ms** | 2885 ms² | 70 ms² | — | — | — |
 
 ¹ Task-level: torchaudio's default anti-aliasing filter (`lowpass_filter_width=6`)
 is far shorter than scipy's/ours (3201 taps here) — mlx-signal matches
@@ -86,11 +86,13 @@ mlx-signal — which is exactly the patchy-MPS-coverage problem this library exi
 to avoid.
 
 Takeaways: nothing else offers GPU `welch`/`csd`/`coherence` (JAX mirrors scipy
-on CPU only; torchaudio has no PSD estimation), `upfirdn` and `find_peaks` are
-scipy-only elsewhere, and the one row another GPU wins — raw `torch.stft` on MPS,
-~1.3x faster — comes as part of a 2 GB torch dependency with the `lfilter` cliff
-above. On-device numbers (arrays already resident) are closer: 3.0 ms mlx-signal
-vs 2.4 ms torch-MPS for that stft.
+on CPU only; torchaudio has no PSD estimation), and `upfirdn`/`find_peaks` are
+scipy-only elsewhere. The one column that competes — `torch.stft` on MPS — edges
+mlx-signal end-to-end (its NumPy↔GPU transfer is cheaper) but loses on-device,
+where the actual transform runs 2x faster here (1.4 ms vs 3.1 ms); and it ships
+inside a 2 GB torch dependency with the `lfilter` cliff above. The spectral core
+frames segments as zero-copy strided views and folds all scaling into the window
+before the FFT, so an stft is just two memory passes: windowed-gather, then FFT.
 
 ## Install
 

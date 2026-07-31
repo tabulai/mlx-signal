@@ -87,15 +87,35 @@ def _detrend_segments(d: mx.array, kind) -> mx.array:
     raise ValueError("Trend type must be 'linear' or 'constant'.")
 
 
+def _frame_view(x: mx.array, nseg: int, nperseg: int, nstep: int) -> mx.array:
+    """Overlapping frames of the last axis as a zero-copy strided view.
+
+    ``mx.as_strided`` addresses the logical row-major flattening of ``x``, so
+    the batch strides are recomputed from the shape; the view materializes only
+    once, inside the window multiply that consumes it.
+    """
+    if not hasattr(mx, "as_strided"):  # very old MLX: gather instead
+        idx = (
+            mx.arange(nperseg, dtype=mx.int32)[None, :]
+            + (nstep * mx.arange(nseg, dtype=mx.int32))[:, None]
+        )
+        return mx.take(x, idx, axis=-1)
+    strides = [1] * x.ndim
+    for i in range(x.ndim - 2, -1, -1):
+        strides[i] = strides[i + 1] * x.shape[i + 1]
+    shape = tuple(x.shape[:-1]) + (nseg, nperseg)
+    return mx.as_strided(x, shape, tuple(strides[:-1] + [nstep, 1]))
+
+
 def _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides):
-    """Frame -> detrend -> window -> batched FFT. Returns (..., nseg, nfreq)."""
+    """Frame -> detrend -> window -> batched FFT. Returns (..., nseg, nfreq).
+
+    ``win`` arrives with sqrt(scale) already folded in (see _spectral_helper),
+    so no post-FFT scaling pass is needed.
+    """
     n = x.shape[-1]
     nseg = (n - nperseg) // nstep + 1
-    idx = (
-        mx.arange(nperseg, dtype=mx.int32)[None, :]
-        + (nstep * mx.arange(nseg, dtype=mx.int32))[:, None]
-    )
-    frames = mx.take(x, idx, axis=-1)
+    frames = _frame_view(x, nseg, nperseg, nstep)
     frames = _detrend_segments(frames, detrend)
     frames = frames * win
     if sides == "onesided":
@@ -156,11 +176,17 @@ def _spectral_helper(
     mode="psd",
     boundary=None,
     padded=False,
+    defer_onesided_factor=False,
 ):
     """MLX port of scipy.signal._spectral_helper (identical layout and scaling).
 
-    Returns ``(freqs, t, result)`` as MLX arrays; ``result`` has the frequency
-    axis at the position of the input ``axis`` and segment times last.
+    Returns ``(freqs, t, result, post_factor)`` as MLX arrays; ``result`` has
+    the frequency axis at the position of the input ``axis`` and segment times
+    last. When ``defer_onesided_factor`` is set and one-sided PSD doubling
+    applies, it is NOT baked into ``result``; instead ``post_factor`` holds the
+    per-frequency factor for the caller to apply after reducing over segments
+    (scaling commutes with mean and median, and the averaged array is ~nseg
+    times smaller). Otherwise ``post_factor`` is None.
     """
     if mode not in ("psd", "stft"):
         raise ValueError(f"Unknown value for mode {mode}, must be one of: ('psd', 'stft')")
@@ -188,12 +214,12 @@ def _spectral_helper(
     if same_data:
         if x.size == 0:
             e = _empty_like_shape(x.shape)
-            return e, e, e
+            return e, e, e, None
     else:
         if x.size == 0 or y.size == 0:
             outshape = outershape + (min(x.shape[axis], y.shape[axis]),)
             emptyout = mx.moveaxis(_empty_like_shape(outshape), -1, axis)
-            return emptyout, emptyout, emptyout
+            return emptyout, emptyout, emptyout, None
 
     if x.ndim > 1 and axis != -1:
         x = mx.moveaxis(x, axis, -1)
@@ -259,10 +285,12 @@ def _spectral_helper(
         scale = 1.0 / float(win_np.sum()) ** 2
     else:
         raise ValueError(f"Unknown scaling: {scaling!r}")
-    if mode == "stft":
-        scale = float(np.sqrt(scale))
 
-    win = mx.array(win_np.astype(np.float32))
+    # Fold sqrt(scale) into the window: the FFT is linear, so each windowed
+    # FFT carries sqrt(scale) — giving F*sqrt(scale) in stft mode and
+    # |F|^2*scale (or conj(Fx)*Fy*scale) in psd/csd mode. This eliminates a
+    # full-size post-FFT multiply pass in every mode.
+    win = mx.array((win_np * np.sqrt(scale)).astype(np.float32))
 
     fx = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides)
     if not same_data:
@@ -274,9 +302,12 @@ def _spectral_helper(
     else:
         result = fx
 
-    result = result * mx.array(scale, dtype=mx.float32)
+    post_factor = None
     if sides == "onesided" and mode == "psd":
-        result = result * _onesided_factor(nfft)
+        if defer_onesided_factor:
+            post_factor = _onesided_factor(nfft)
+        else:
+            result = result * _onesided_factor(nfft)
 
     t_np = np.arange(nperseg / 2, x.shape[-1] - nperseg / 2 + 1, nstep) / float(fs)
     if boundary is not None:
@@ -290,6 +321,7 @@ def _spectral_helper(
         mx.array(freqs_np.astype(np.float32)),
         mx.array(t_np.astype(np.float32)),
         result,
+        post_factor,
     )
 
 
@@ -360,7 +392,7 @@ def csd(
         )
         return result_to_mlx(f), result_to_mlx(p)
 
-    freqs, _, pxy = _spectral_helper(
+    freqs, _, pxy, post_factor = _spectral_helper(
         x,
         y,
         fs,
@@ -373,6 +405,7 @@ def csd(
         scaling,
         axis,
         mode="psd",
+        defer_onesided_factor=True,
     )
     if pxy.ndim >= 1 and pxy.shape[-1] > 1:
         if average == "median":
@@ -388,6 +421,13 @@ def csd(
             pxy = mx.mean(pxy, axis=-1)
     else:
         pxy = mx.reshape(pxy, pxy.shape[:-1])
+    if post_factor is not None:
+        # the deferred one-sided doubling: freq is at `axis`, so align the
+        # per-frequency factor there before broadcasting
+        ax = axis if axis >= 0 else pxy.ndim + axis
+        fshape = [1] * pxy.ndim
+        fshape[ax] = post_factor.shape[0]
+        pxy = pxy * post_factor.reshape(fshape)
     return freqs, pxy
 
 
@@ -544,7 +584,7 @@ def spectrogram(
         noverlap = nperseg // 8
 
     helper_mode = "psd" if mode == "psd" else "stft"
-    freqs, time, sxx = _spectral_helper(
+    freqs, time, sxx, _ = _spectral_helper(
         x, x, fs, window, nperseg, noverlap, nfft, detrend,
         return_onesided, scaling, axis, mode=helper_mode,
     )
@@ -599,11 +639,12 @@ def stft(
         )
         return result_to_mlx(f), result_to_mlx(t), result_to_mlx(z)
 
-    return _spectral_helper(
+    freqs, t, zxx, _ = _spectral_helper(
         x, x, fs, window, nperseg, noverlap, nfft, detrend,
         return_onesided, scaling=scaling, axis=axis, mode="stft",
         boundary=boundary, padded=padded,
     )
+    return freqs, t, zxx
 
 
 def _overlap_add(xsubs_t: mx.array, outputlength: int, nstep: int) -> mx.array:
