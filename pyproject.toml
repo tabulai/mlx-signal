@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-signal"
+version = "0.1.0.dev0"
+description = "Metal/MLX-accelerated signal processing for Apple Silicon, mirroring scipy.signal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Bojan Tunguz" }]
+keywords = ["mlx", "metal", "signal-processing", "apple-silicon", "dsp", "scipy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mlx>=0.26",
+    "numpy>=1.24",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5", "hypothesis>=6"]
+
+[project.urls]
+Homepage = "https://github.com/tunguz/mlx-signal"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_signal"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# E741: single-letter names like `l`/`I` are conventional in DSP code
+ignore = ["E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: test requires a Metal GPU (skipped on CPU-only runners)",
+    "slow: long-running test",
+]
