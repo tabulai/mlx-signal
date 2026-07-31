@@ -1,9 +1,11 @@
-"""Filtering: FIR design (host-side), FIR application (GPU), hilbert, filtfilt.
+"""Filtering: FIR design (host-side), FIR/IIR application (GPU), hilbert.
 
-The FIR fast paths run entirely on the GPU via FFT convolution. General IIR
-filtering (``a`` with more than one tap) is inherently recursive and is
-deferred to a future release (planned: batched IIR via associative scan);
-those calls fall back to scipy with a :class:`~mlx_signal.FallbackWarning`.
+FIR paths run on the GPU via FFT convolution. IIR in second-order-section form
+(:func:`sosfilt`/:func:`sosfiltfilt`) runs on the GPU through two custom Metal
+kernels — per-channel-sequential for short signals, block-parallel associative
+scan for long ones. Transfer-function IIR (``lfilter`` with ``len(a) > 1``)
+falls back to scipy with a :class:`~mlx_signal.FallbackWarning`; prefer the
+better-conditioned SOS form, as scipy itself recommends.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from . import _fft_core as _sfft
 from ._array import input_size, result_to_mlx, to_mlx, to_numpy
 from ._arraytools import const_ext, even_ext, odd_ext
 from ._config import capability_fallback, get_config, use_mlx
+from ._sosfilt_metal import SCAN_BLOCK as _SCAN_BLOCK_REF
 from .convolution import oaconvolve
 
 __all__ = ["filtfilt", "firwin", "firwin2", "hilbert", "lfilter", "sosfilt", "sosfiltfilt"]
@@ -220,10 +223,10 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
 # IIR: second-order sections (batched-channel GPU kernel)
 # ---------------------------------------------------------------------------
 
-#: under dispatch="auto", the per-channel-sequential kernel needs at least this
-#: many rows to beat scipy's single-core loop (measured crossover on M4 Max:
-#: the kernel is latency-bound at ~100 ms per 2^20 samples regardless of
-#: channel count; scipy scales linearly at ~5 ms per channel)
+#: signals at least this long use the block-parallel scan kernel (parallel over
+#: time as well as channels); shorter ones use the per-channel-sequential
+#: kernel, which under dispatch="auto" needs this many rows to beat scipy
+_SCAN_MIN_N = 2 * _SCAN_BLOCK_REF
 _SOSFILT_MIN_ROWS = 32
 
 
@@ -248,14 +251,16 @@ def sosfilt(sos, x, axis=-1, zi=None):
     """Filter data along one dimension using cascaded second-order sections.
 
     scipy-compatible (direct form II transposed, identical ``zi``/``zf``
-    contract). On the GPU one thread runs one channel's recurrence with the
-    whole cascade unrolled in registers, so batched multichannel IIR runs in
-    parallel; with fewer than ~32 channels under ``dispatch="auto"`` the call
-    routes to scipy, where a single fast core wins (block-parallel
-    single-channel IIR via associative scan is on the roadmap). Coefficients
-    are applied in float32 (like every array in this library) — well within
-    tolerance for SOS cascades of reasonable Q, which is exactly what the SOS
-    factorization is for.
+    contract). Signals longer than ~2k samples run the block-parallel scan
+    kernel — the cascade is a linear system, so blocks compute their
+    contributions in parallel and entry states compose through the
+    precomputed A^L transition — which is parallel over time as well as
+    channels and beats scipy from a single channel up (7x at 1ch, 100x at
+    256ch on M4 Max). Short signals use a per-channel-sequential kernel when
+    there are enough channels, else scipy. Coefficients are applied in
+    float32 (like every array in this library) — well within tolerance for
+    SOS cascades of reasonable Q, which is exactly what the SOS factorization
+    is for.
     """
     from . import _sosfilt_metal
 
@@ -302,11 +307,21 @@ def sosfilt(sos, x, axis=-1, zi=None):
                   else "no Metal GPU")
         capability_fallback("sosfilt", reason)
         return _scipy_path()
-    if get_config().dispatch == "auto" and batch < _SOSFILT_MIN_ROWS:
-        # few channels: scipy's single fast core beats a near-empty GPU
+    use_scan = n >= _SCAN_MIN_N
+    if (
+        get_config().dispatch == "auto"
+        and not use_scan
+        and batch < _SOSFILT_MIN_ROWS
+    ):
+        # short signal, few channels: scipy's single fast core wins
         return _scipy_path()
 
     sos_flat = mx.array(np.ascontiguousarray(sos_np, dtype=np.float32).reshape(-1))
+
+    def _run(x2p, zi2p):
+        if use_scan:
+            return _sosfilt_metal.sosfilt_scan_gpu(x2p, sos_np, zi2p)
+        return _sosfilt_metal.sosfilt_gpu(x2p, sos_flat, zi2p)
 
     ax = axis % xa.ndim
     moved = xa.ndim > 1 and ax != xa.ndim - 1
@@ -328,15 +343,15 @@ def sosfilt(sos, x, axis=-1, zi=None):
     if x2.dtype == mx.complex64:
         if zi is not None and zi2.dtype != mx.complex64:
             zi2 = zi2.astype(mx.complex64)
-        yr, zr = _sosfilt_metal.sosfilt_gpu(mx.real(x2), sos_flat, mx.real(zi2))
-        yi, zim = _sosfilt_metal.sosfilt_gpu(mx.imag(x2), sos_flat, mx.imag(zi2))
+        yr, zr = _run(mx.real(x2), mx.real(zi2))
+        yi, zim = _run(mx.imag(x2), mx.imag(zi2))
         j = mx.array(1j)
         y2 = yr.astype(mx.complex64) + yi.astype(mx.complex64) * j
         zf2 = zr.astype(mx.complex64) + zim.astype(mx.complex64) * j
     else:
         if zi is not None and zi2.dtype == mx.complex64:
             raise ValueError("complex zi requires complex x")
-        y2, zf2 = _sosfilt_metal.sosfilt_gpu(x2, sos_flat, zi2)
+        y2, zf2 = _run(x2, zi2)
 
     y = y2.reshape(batch_shape + (n,))
     if moved:

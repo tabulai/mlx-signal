@@ -218,3 +218,202 @@ def rfft_frames(x: mx.array, win: mx.array, nperseg: int, hop: int, detrend,
     if not power:
         out = mx.view(out, mx.complex64)
     return out.reshape(batch_shape + (nseg, M + 1))
+
+
+# ---------------------------------------------------------------------------
+# two-signal variant: csd / coherence in one sweep
+# ---------------------------------------------------------------------------
+
+_PAIR_FFT = """
+    {{
+        threadgroup float2* A = buf0;
+        threadgroup float2* B = buf1;
+        int l = {M} / 2;
+        int stride = 1;
+        int m = 1;
+        for (int s = 0; s < {S}; s++) {{
+            for (int p = tid; p < {M} / 2; p += {T}) {{
+                int j = p / m;
+                int k = p - j * m;
+                float2 c0 = A[k + j * m];
+                float2 c1 = A[k + j * m + l * m];
+                float2 d = c0 - c1;
+                B[k + 2 * j * m]     = c0 + c1;
+                B[k + 2 * j * m + m] = cmul(twf[j * stride], d);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float2* tmp = A; A = B; B = tmp;
+            l >>= 1;
+            stride <<= 1;
+            m <<= 1;
+        }}
+        Z = A;
+    }}
+"""
+
+
+def _pair_load(sig: str, N: int, M: int, T: int, detrend: bool) -> str:
+    if not detrend:
+        return f"""
+    for (int i = tid; i < {M}; i += {T}) {{
+        buf0[i] = float2({sig}[2 * i] * win[2 * i], {sig}[2 * i + 1] * win[2 * i + 1]);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+"""
+    return f"""
+    {{
+        float acc = 0.0f;
+        for (int i = tid; i < {M}; i += {T}) {{
+            float a = {sig}[2 * i];
+            float b = {sig}[2 * i + 1];
+            acc += a + b;
+            buf0[i] = float2(a, b);
+        }}
+        red[tid] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int off = {T} / 2; off > 0; off >>= 1) {{
+            if ((int)tid < off) red[tid] += red[tid + off];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        float mean = red[0] / (float){N};
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < {M}; i += {T}) {{
+            float2 v = buf0[i];
+            buf0[i] = float2((v.x - mean) * win[2 * i], (v.y - mean) * win[2 * i + 1]);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+"""
+
+
+_PAIR_OUT_CSD = """
+    for (int i = 0; i < {KMAX}; ++i) {{
+        int k = (int)tid + i * {T};
+        if (k > {M}) continue;
+        float2 Xk = hold[i];
+        float2 Yk = untangle(k, Z, utf);
+        // conj(X) * Y
+        float2 P = float2(Xk.x * Yk.x + Xk.y * Yk.y, Xk.x * Yk.y - Xk.y * Yk.x);
+        device float* orow = out + (long)seg * (2 * ({M} + 1));
+        orow[2 * k]     = P.x;
+        orow[2 * k + 1] = P.y;
+    }}
+"""
+
+_PAIR_OUT_TRIO = """
+    for (int i = 0; i < {KMAX}; ++i) {{
+        int k = (int)tid + i * {T};
+        if (k > {M}) continue;
+        float2 Xk = hold[i];
+        float2 Yk = untangle(k, Z, utf);
+        float2 P = float2(Xk.x * Yk.x + Xk.y * Yk.y, Xk.x * Yk.y - Xk.y * Yk.x);
+        pxx[(long)seg * ({M} + 1) + k] = Xk.x * Xk.x + Xk.y * Xk.y;
+        pyy[(long)seg * ({M} + 1) + k] = Yk.x * Yk.x + Yk.y * Yk.y;
+        device float* orow = pxy + (long)seg * (2 * ({M} + 1));
+        orow[2 * k]     = P.x;
+        orow[2 * k + 1] = P.y;
+    }}
+"""
+
+_PAIR_SRC = """
+    uint tid = thread_index_in_threadgroup;
+    uint seg = threadgroup_position_in_grid.y;
+    int n      = params[0];
+    int hop    = params[1];
+    int nseg   = params[2];
+    int total  = params[3];
+    if ((int)seg >= total) return;
+
+    int row  = (int)seg / nseg;
+    int s_in = (int)seg % nseg;
+    const device float* xseg = xa + (long)row * n + (long)s_in * hop;
+    const device float* yseg = xb + (long)row * n + (long)s_in * hop;
+    const device float2* twf = (const device float2*)tw;
+    const device float2* utf = (const device float2*)ut;
+
+    threadgroup float2 buf0[{M}];
+    threadgroup float2 buf1[{M}];
+    threadgroup float red[{T}];
+    threadgroup float2* Z;
+    float2 hold[{KMAX}];
+
+{LOAD_X}
+{FFT}
+    for (int i = 0; i < {KMAX}; ++i) {{
+        int k = (int)tid + i * {T};
+        hold[i] = (k <= {M}) ? untangle(k, Z, utf) : float2(0.0f, 0.0f);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+{LOAD_Y}
+{FFT}
+{OUT_BLOCK}
+"""
+
+
+@functools.lru_cache(maxsize=32)
+def _pair_kernel(N: int, detrend: bool, trio: bool):
+    M = N // 2
+    S = int(math.log2(M))
+    T = min(256, max(32, M // 2))
+    kmax = -(-(M + 1) // T)
+    fft = _PAIR_FFT.format(M=M, S=S, T=T)
+    out = (_PAIR_OUT_TRIO if trio else _PAIR_OUT_CSD).format(M=M, T=T, KMAX=kmax)
+    src = _PAIR_SRC.format(
+        M=M, T=T, KMAX=kmax, FFT=fft,
+        LOAD_X=_pair_load("xseg", N, M, T, detrend),
+        LOAD_Y=_pair_load("yseg", N, M, T, detrend),
+        OUT_BLOCK=out,
+    )
+    kern = mx.fast.metal_kernel(
+        name=f"mlx_signal_csd_{N}_{int(detrend)}_{int(trio)}",
+        input_names=["xa", "xb", "tw", "ut", "win", "params"],
+        output_names=["pxx", "pyy", "pxy"] if trio else ["out"],
+        source=src,
+        header=_HEADER.format(M=M),
+    )
+    return kern, T, M
+
+
+def _pair_launch(x, y, win, nperseg, hop, detrend, trio):
+    n = x.shape[-1]
+    nseg = (n - nperseg) // hop + 1
+    batch_shape = x.shape[:-1]
+    x2 = x.reshape(-1, n)
+    y2 = y.reshape(-1, n)
+    total = x2.shape[0] * nseg
+
+    do_detrend = detrend in ("constant", "c")
+    kern, T, M = _pair_kernel(nperseg, do_detrend, trio)
+    tw, ut = _tables(nperseg)
+    params = mx.array([n, hop, nseg, total], dtype=mx.int32)
+
+    if trio:
+        shapes = [(total, M + 1), (total, M + 1), (total, 2 * (M + 1))]
+        dtypes = [mx.float32, mx.float32, mx.float32]
+    else:
+        shapes = [(total, 2 * (M + 1))]
+        dtypes = [mx.float32]
+    outs = kern(
+        inputs=[x2, y2, tw, ut, win, params],
+        grid=(T, total, 1),
+        threadgroup=(T, 1, 1),
+        output_shapes=shapes,
+        output_dtypes=dtypes,
+    )
+    if trio:
+        pxx = outs[0].reshape(batch_shape + (nseg, M + 1))
+        pyy = outs[1].reshape(batch_shape + (nseg, M + 1))
+        pxy = mx.view(outs[2], mx.complex64).reshape(batch_shape + (nseg, M + 1))
+        return pxx, pyy, pxy
+    return mx.view(outs[0], mx.complex64).reshape(batch_shape + (nseg, M + 1))
+
+
+def csd_frames(x, y, win, nperseg, hop, detrend):
+    """conj(F(x_seg)) * F(y_seg) for all segments, one fused sweep."""
+    return _pair_launch(x, y, win, nperseg, hop, detrend, trio=False)
+
+
+def coherence_frames(x, y, win, nperseg, hop, detrend):
+    """(|Fx|^2, |Fy|^2, conj(Fx)*Fy) per segment in one fused sweep."""
+    return _pair_launch(x, y, win, nperseg, hop, detrend, trio=True)

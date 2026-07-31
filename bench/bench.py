@@ -191,6 +191,22 @@ def build_cases(quick: bool) -> list[Case]:
         (x, b),
     ))
 
+    # --- csd / coherence (fused two-signal kernel) ---------------------------
+    x = sig((64, 1 << 20)) if not quick else sig((8, 1 << 18))
+    y2 = sig(x.shape)
+    cases.append(Case(
+        "csd", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, nperseg=1024",
+        lambda x=x, y2=y2: sps.csd(x, y2, nperseg=1024),
+        lambda x=x, y2=y2: msig.csd(x, y2, nperseg=1024),
+        (x, y2),
+    ))
+    cases.append(Case(
+        "coherence", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, nperseg=1024",
+        lambda x=x, y2=y2: sps.coherence(x, y2, nperseg=1024),
+        lambda x=x, y2=y2: msig.coherence(x, y2, nperseg=1024),
+        (x, y2),
+    ))
+
     # --- IIR (batched-channel kernel) ---------------------------------------
     x = sig((256, 1 << 20)) if not quick else sig((64, 1 << 18))
     sos_iir = np.asarray(sps.butter(8, 0.2, output="sos"), dtype=np.float64)
@@ -199,6 +215,13 @@ def build_cases(quick: bool) -> list[Case]:
         lambda x=x, s_=sos_iir: sps.sosfilt(s_.astype(np.float32), x, axis=-1),
         lambda x=x, s_=sos_iir: msig.sosfilt(s_, x, axis=-1),
         (x,),
+    ))
+    x1 = sig((1, 1 << 22))
+    cases.append(Case(
+        "sosfilt (IIR, 1ch scan)", "1ch x 2^22, butter-8",
+        lambda x=x1, s_=sos_iir: sps.sosfilt(s_.astype(np.float32), x, axis=-1),
+        lambda x=x1, s_=sos_iir: msig.sosfilt(s_, x, axis=-1),
+        (x1,),
     ))
     cases.append(Case(
         "sosfiltfilt (IIR)", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, butter-8",
@@ -284,7 +307,16 @@ def _device_variant(case: Case, mx_inputs):
         return lambda: msig.lfilter(a[1], [1.0], a[0], axis=-1)
     if n == "filtfilt (FIR)":
         return lambda: msig.filtfilt(a[1], [1.0], a[0], axis=-1)
+    if n == "csd":
+        return lambda: msig.csd(a[0], a[1], nperseg=1024)
+    if n == "coherence":
+        return lambda: msig.coherence(a[0], a[1], nperseg=1024)
     if n == "sosfilt (IIR)":
+        import scipy.signal as _sps
+
+        sos_iir = _sps.butter(8, 0.2, output="sos")
+        return lambda: msig.sosfilt(sos_iir, a[0], axis=-1)
+    if n == "sosfilt (IIR, 1ch scan)":
         import scipy.signal as _sps
 
         sos_iir = _sps.butter(8, 0.2, output="sos")

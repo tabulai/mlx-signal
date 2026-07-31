@@ -130,16 +130,47 @@ def test_sosfilt_many_sections_falls_back(rng):
         msig.sosfilt(sos, x)  # dispatch="mlx" pinned by fixture
 
 
-def test_sosfilt_few_channels_routes_to_scipy_under_auto(rng):
+def test_sosfilt_single_channel_uses_scan_under_auto(rng):
+    """Long single-channel input runs the block-parallel scan kernel on GPU."""
     import mlx.core as mx
 
     sos = FILTERS[0]
-    x = rng.standard_normal(200000).astype(np.float32)  # big but single channel
+    x = rng.standard_normal(200000).astype(np.float32)
     with msig.config_context(dispatch="auto"):
-        out = msig.sosfilt(sos, x)  # silent perf routing
+        out = msig.sosfilt(sos, x)
     assert isinstance(out, mx.array) and out.dtype == mx.float32
     np.testing.assert_allclose(np.array(out), _f32_ref(sos, x), rtol=1e-5,
                                atol=1e-5 * np.abs(np.array(out)).max())
+
+
+def test_sosfilt_short_signal_sequential_kernel(rng):
+    """n below the scan threshold exercises the per-channel-sequential kernel."""
+    sos = FILTERS[1]
+    x = rng.standard_normal((40, 1500)).astype(np.float32)
+    ref = _f32_ref(sos, x)
+    np.testing.assert_allclose(np.array(msig.sosfilt(sos, x)), ref, rtol=1e-6,
+                               atol=1e-6 * np.abs(ref).max())
+
+
+def test_scan_and_sequential_kernels_agree(rng):
+    """The two GPU implementations are independent; they must agree."""
+    import mlx.core as mx
+
+    from mlx_signal import _sosfilt_metal
+
+    if not mx.metal.is_available():
+        pytest.skip("no Metal GPU")
+    sos = np.asarray(FILTERS[2], dtype=np.float64)
+    S = sos.shape[0]
+    x = mx.array(rng.standard_normal((3, 50001)).astype(np.float32))
+    zi = mx.array(rng.standard_normal((3, S, 2)).astype(np.float32) * 0.1)
+    sflat = mx.array(sos.astype(np.float32).reshape(-1))
+    y_seq, zf_seq = _sosfilt_metal.sosfilt_gpu(x, sflat, zi)
+    y_scan, zf_scan = _sosfilt_metal.sosfilt_scan_gpu(x, sos, zi)
+    np.testing.assert_allclose(np.array(y_scan), np.array(y_seq), rtol=1e-4,
+                               atol=1e-5 * float(mx.max(mx.abs(y_seq))))
+    np.testing.assert_allclose(np.array(zf_scan), np.array(zf_seq), rtol=1e-4,
+                               atol=1e-5)
 
 
 @pytest.mark.parametrize("padtype", ["odd", "even", "constant", None])

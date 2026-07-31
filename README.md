@@ -33,6 +33,8 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | welch | 64ch × 2^20, nperseg=1024 | 495.0 ms | 8.5 ms | 4.3 ms | **58.5x / 115.0x** |
 | welch | 1ch × 2^22, nperseg=4096 | 49.6 ms | 1.9 ms | 1.3 ms | **25.9x / 39.3x** |
 | welch | 256ch × 2^16, nperseg=256 | 115.0 ms | 4.7 ms | 1.1 ms | **24.3x / 106.1x** |
+| csd | 64ch × 2^20, nperseg=1024 | 936.5 ms | 16.3 ms | 8.2 ms | **57.6x / 114.4x** |
+| coherence | 64ch × 2^20, nperseg=1024 | 1944.9 ms | 17.6 ms | 9.8 ms | **110.5x / 199.2x** |
 | spectrogram | 16ch × 2^20 | 68.7 ms | 6.8 ms | 1.3 ms | **10.1x / 53.7x** |
 | stft | 16ch × 2^20, nperseg=1024 | 81.4 ms | 4.7 ms | 1.3 ms | **17.3x / 63.8x** |
 | fftconvolve | 2^20 × 4097 | 11.2 ms | 1.8 ms | 1.5 ms | **6.4x / 7.5x** |
@@ -44,8 +46,9 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | resample (FFT) | 2^20 → 2^18 | 4.3 ms | 0.4 ms | 0.3 ms | **11.0x / 14.4x** |
 | hilbert | 2^20 | 9.9 ms | 0.8 ms | 0.6 ms | **12.9x / 17.9x** |
 | lfilter (FIR) | 64ch × 2^20, 257 taps | 1634.7 ms | 17.7 ms | 9.8 ms | **92.1x / 167.7x** |
-| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1307.6 ms | 158.9 ms | 128.2 ms | **8.2x / 10.2x** |
-| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2693.9 ms | 602.4 ms | 518.4 ms | **4.5x / 5.2x** |
+| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1306.4 ms | 42.5 ms | 12.0 ms | **30.8x / 109.2x** |
+| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 20.6 ms | 2.0 ms | 1.3 ms | **10.4x / 16.1x** |
+| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2680.6 ms | 125.2 ms | 41.0 ms | **21.4x / 65.4x** |
 | filtfilt (FIR) | 64ch × 2^20, 257 taps | 3271.8 ms | 44.5 ms | 23.6 ms | **73.5x / 138.5x** |
 | resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 66.5 ms | 7.3 ms | 5.5 ms | **9.2x / 12.1x** |
 | hilbert >1M samples¹ | 2^23 | 102.6 ms | 8.1 ms | 6.5 ms | **12.7x / 15.8x** |
@@ -87,8 +90,10 @@ mlx-signal — which is exactly the patchy-MPS-coverage problem this library exi
 to avoid.
 
 Takeaways: nothing else offers GPU `welch`/`csd`/`coherence` (JAX mirrors scipy
-on CPU only; torchaudio has no PSD estimation), and `upfirdn`/`find_peaks` are
-scipy-only elsewhere. The one column that competes — `torch.stft` on MPS — still
+on CPU only; torchaudio has no PSD estimation) — and here `csd`/`coherence` get
+their own two-signal variant of the fused kernel that computes both spectra and
+the cross spectrum in a single sweep (coherence: one pass instead of scipy's
+five). `upfirdn`/`find_peaks` are scipy-only elsewhere. The one column that competes — `torch.stft` on MPS — still
 edges mlx-signal end-to-end (its NumPy↔GPU transfer is cheaper) but loses badly
 on-device, where the transform itself runs 3.5x faster here (0.96 ms vs 3.4 ms);
 and it ships inside a 2 GB torch dependency with the `lfilter` cliff above. The
@@ -106,7 +111,7 @@ Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 ```bash
 git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # 327 golden tests against scipy and NumPy
+python -m pytest -q         # 329 golden tests against scipy and NumPy
 ```
 
 (PyPI release planned for 0.1.0.)
@@ -122,19 +127,19 @@ python -m pytest -q         # 327 golden tests against scipy and NumPy
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
 | utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
 
-**IIR runs on the GPU when batched.** `sosfilt`/`sosfiltfilt` (and `decimate`'s
-default `ftype="iir"`) run scipy's exact direct-form-II-transposed cascade in a
-custom Metal kernel — one thread per channel, the whole cascade unrolled in
-registers, with native `zi`/`zf` state so streaming chunk-by-chunk works. The
-kernel is bit-identical to scipy executing in float32. An IIR recurrence is
-serial in time, so the win comes from channel count: ~2.8x at 64 channels, 10x
-at 256 (measured, butter-8). Below ~32 channels `dispatch="auto"` routes to
-scipy, where one fast core beats a nearly-empty GPU — block-parallel
-single-channel IIR via associative scan is the roadmap item. `lfilter` with
-`len(a) > 1` (transfer-function form) still falls back to scipy with a
-`FallbackWarning`; use the better-conditioned SOS form, as scipy itself
-recommends. You will not silently run on one core believing you're on 40 GPU
-cores.
+**IIR runs on the GPU — even single-channel.** `sosfilt`/`sosfiltfilt` (and
+`decimate`'s default `ftype="iir"`) run scipy's exact direct-form-II-transposed
+cascade in custom Metal kernels with native `zi`/`zf` state, so streaming
+chunk-by-chunk works. Long signals use a block-parallel associative-scan
+kernel: the cascade is a linear system, so blocks compute their contributions
+in parallel and entry states compose through the host-precomputed `A^L`
+transition — parallel over time as well as channels, matching scipy's float32
+results to ~1e-6 and beating it from one channel (16x) to 256 (109x). Short
+signals use a per-channel-sequential kernel (bit-identical to float32 scipy)
+when there are enough channels, else scipy. `lfilter` with `len(a) > 1`
+(transfer-function form) still falls back to scipy with a `FallbackWarning`;
+use the better-conditioned SOS form, as scipy itself recommends. You will not
+silently run on one core believing you're on 40 GPU cores.
 
 ## Dispatch: when the GPU is used
 
@@ -187,9 +192,8 @@ rather than hidden.
 
 ## Roadmap
 
-- **Single-channel IIR via associative scan** (`sosfilt` is GPU-batched across
-  channels today; block-parallel scan would win the few-channel case too) and
-  transfer-function `lfilter` IIR
+- Transfer-function `lfilter`/`filtfilt` IIR (SOS form is GPU-native today;
+  tf form falls back to scipy)
 - **CWT** — scipy *removed* `cwt` in 1.15, so this is a differentiator, not a clone
 - Modern `ShortTimeFFT` class
 - fp16 mode; real-time streaming API; torchaudio benchmark column

@@ -315,15 +315,25 @@ def _spectral_helper(
     win = mx.array((win_np * np.sqrt(scale)).astype(np.float32))
 
     want_power = same_data and mode == "psd"
-    fx, is_power = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides,
-                               want_power=want_power)
-    if not same_data:
+    if (
+        not same_data
+        and x.shape == y.shape
+        and y.dtype == mx.float32
+        and _stft_metal.eligible(x, nperseg, nfft, sides, detrend)
+    ):
+        # fused two-signal sweep: both FFTs and the conjugate product in one kernel
+        result = _stft_metal.csd_frames(x, y, win, nperseg, nstep, detrend)
+    elif not same_data:
+        fx, _ = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides)
         fy, _ = _fft_frames(y, win, detrend, nperseg, nstep, nfft, sides)
         result = mx.conj(fx) * fy
     elif mode == "psd":
+        fx, is_power = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides,
+                                   want_power=want_power)
         # |F|^2: either straight from the fused kernel, or one compiled pass
         result = fx if is_power else _fused_power(fx)
     else:
+        fx, _ = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides)
         result = fx
 
     post_factor = None
@@ -548,7 +558,43 @@ def coherence(
     x, y, fs=1.0, window="hann", nperseg=None, noverlap=None, nfft=None,
     detrend="constant", axis=-1,
 ):
-    """Magnitude squared coherence estimate, |Pxy|^2/(Pxx*Pyy) (scipy-compatible)."""
+    """Magnitude squared coherence estimate, |Pxy|^2/(Pxx*Pyy) (scipy-compatible).
+
+    On the fused-kernel fast path (equal-shape real inputs, pow2 nperseg) both
+    signals' spectra and the cross spectrum come out of one GPU sweep instead
+    of the three scipy makes; all scale factors cancel in the ratio.
+    """
+    fast = use_mlx(max(input_size(x), input_size(y))) and not callable(detrend)
+    if fast:
+        xa, ya = to_mlx(x), to_mlx(y)
+        if (
+            xa.shape == ya.shape
+            and xa.dtype == mx.float32
+            and ya.dtype == mx.float32
+            and xa.shape[axis] > 0
+        ):
+            win_np, nps = _triage_segments(window, nperseg, input_length=xa.shape[axis])
+            nov = nps // 2 if noverlap is None else int(noverlap)
+            nft = nps if nfft is None else int(nfft)
+            if nov < nps and _stft_metal.eligible(xa, nps, nft, "onesided", detrend):
+                ax = axis % xa.ndim
+                if xa.ndim > 1 and ax != xa.ndim - 1:
+                    xa = mx.moveaxis(xa, ax, -1)
+                    ya = mx.moveaxis(ya, ax, -1)
+                win = mx.array(win_np.astype(np.float32))
+                pxx, pyy, pxy = _stft_metal.coherence_frames(
+                    xa, ya, win, nps, nps - nov, detrend
+                )
+                pxx = mx.mean(pxx, axis=-2)
+                pyy = mx.mean(pyy, axis=-2)
+                pxy = mx.mean(pxy, axis=-2)
+                a = mx.abs(pxy)
+                cxy = a * a / pxx / pyy
+                if cxy.ndim > 1 and ax != cxy.ndim - 1:
+                    cxy = mx.moveaxis(cxy, -1, ax)
+                freqs = mx.array(np.fft.rfftfreq(nft, 1 / fs).astype(np.float32))
+                return freqs, cxy
+
     freqs, pxx = welch(
         x, fs=fs, window=window, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
         detrend=detrend, axis=axis,
