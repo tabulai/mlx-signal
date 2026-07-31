@@ -42,20 +42,47 @@ def _kw(n: int) -> dict:
 
 
 def rfft(a, n=None, axis=-1):
-    return mx.fft.rfft(a, n=n, axis=axis, **_kw(a.shape[axis] if n is None else n))
+    length = int(a.shape[axis] if n is None else n)
+    if metal_fft_broken(length):
+        from . import _fourstep
+
+        out = _fourstep.rfft_large(a, length, axis)
+        if out is not None:
+            return out
+    return mx.fft.rfft(a, n=n, axis=axis, **_kw(length))
 
 
 def irfft(a, n=None, axis=-1):
-    length = 2 * (a.shape[axis] - 1) if n is None else n
+    length = int(2 * (a.shape[axis] - 1) if n is None else n)
+    if metal_fft_broken(length):
+        from . import _fourstep
+
+        out = _fourstep.irfft_large(a, length, axis)
+        if out is not None:
+            return out
     return mx.fft.irfft(a, n=n, axis=axis, **_kw(length))
 
 
 def fft(a, n=None, axis=-1):
-    return mx.fft.fft(a, n=n, axis=axis, **_kw(a.shape[axis] if n is None else n))
+    length = int(a.shape[axis] if n is None else n)
+    if metal_fft_broken(length):
+        from . import _fourstep
+
+        out = _fourstep.fft_large(a, length, axis)
+        if out is not None:
+            return out
+    return mx.fft.fft(a, n=n, axis=axis, **_kw(length))
 
 
 def ifft(a, n=None, axis=-1):
-    return mx.fft.ifft(a, n=n, axis=axis, **_kw(a.shape[axis] if n is None else n))
+    length = int(a.shape[axis] if n is None else n)
+    if metal_fft_broken(length):
+        from . import _fourstep
+
+        out = _fourstep.ifft_large(a, length, axis)
+        if out is not None:
+            return out
+    return mx.fft.ifft(a, n=n, axis=axis, **_kw(length))
 
 
 def _any_broken(a, s, axes) -> bool:

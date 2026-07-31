@@ -45,16 +45,15 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | hilbert | 2^20 | 9.9 ms | 0.8 ms | 0.6 ms | **12.9x / 17.9x** |
 | lfilter (FIR) | 64ch × 2^20, 257 taps | 1634.7 ms | 17.7 ms | 9.8 ms | **92.1x / 167.7x** |
 | filtfilt (FIR) | 64ch × 2^20, 257 taps | 3271.8 ms | 44.5 ms | 23.6 ms | **73.5x / 138.5x** |
-| resample (FFT) >1M samples | 2^23 → ×0.75 | 67.1 ms | 65.7 ms | 64.2 ms | 1.0x¹ |
-| hilbert >1M samples | 2^23 | 103.3 ms | 180.4 ms | 177.3 ms | 0.6x¹ |
+| resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 66.5 ms | 7.3 ms | 5.5 ms | **9.2x / 12.1x** |
+| hilbert >1M samples¹ | 2^23 | 102.6 ms | 8.1 ms | 6.5 ms | **12.7x / 15.8x** |
 | find_peaks | 2^23, prominence=1 | 218.0 ms | 217.2 ms | — | 1.0x² |
 
 ¹ MLX 0.32's Metal FFT is broken above 2^20 (see *Known limitations*); mlx-signal
-routes those transform lengths through the CPU stream for correctness. Blocked
-algorithms keep long-signal *filtering* on the GPU (see fftconvolve 2^22 above);
-only functions needing one giant FFT (`resample`, `hilbert` on >1M samples) drop
-to ~CPU speed until the upstream fix. For rational ratios, `resample_poly` is the
-fast path at any length.
+runs those transform lengths through its own four-step (Bailey) decomposition —
+two batched safe-size sub-FFTs plus a twiddle multiply — entirely on the GPU.
+Only lengths with no safe factorization (e.g. large primes) fall back to a
+CPU-stream FFT.
 ² `find_peaks` is bandwidth-bound index bookkeeping — the wrong shape for a GPU.
 It is included for pipeline completeness (GPU sign-diff prefilter, host refinement)
 and priced honestly at ~1x.
@@ -105,7 +104,7 @@ Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 ```bash
 git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # 274 golden tests against scipy
+python -m pytest -q         # 292 golden tests against scipy and NumPy
 ```
 
 (PyPI release planned for 0.1.0.)
@@ -163,11 +162,13 @@ rather than hidden.
 - **MLX 0.32 Metal FFT above 2^20 is broken upstream** — lengths in
   (2^19, 2^21] except 2^20 *crash* ("Unable to load function four_step_mem_…"),
   and, worse, other lengths above 2^20 *silently return wrong values*
-  (rel. error ~1.0). mlx-signal verified the safe region empirically and routes
-  every untrusted length through the MLX CPU stream (`_fft_core.py`), while
-  `fftconvolve` switches to blocked overlap-add so long-signal filtering stays on
-  the GPU. When MLX fixes this, relaxing one predicate reclaims full performance.
-  (Worth reporting upstream to `ml-explore/mlx` if you can reproduce it.)
+  (rel. error ~1.0). mlx-signal verified the safe region empirically and works
+  around it on the GPU: 1-D transforms use an in-library four-step (Bailey)
+  decomposition into safe-size sub-FFTs (`_fourstep.py`), and `fftconvolve`
+  switches to blocked overlap-add. Only unsplittable lengths (large primes) and
+  the N-d FFT paths route through the MLX CPU stream (`_fft_core.py`). When MLX
+  fixes this, relaxing one predicate retires the workaround. (Worth reporting
+  upstream to `ml-explore/mlx` if you can reproduce it.)
 - Windows/filter design (`get_window`, `firwin*`) and `find_peaks` refinement run
   host-side — tiny work, and it keeps exact scipy parity.
 - `lfilter`/`filtfilt` don't take `zi` on the GPU path yet (falls back, warns).
@@ -181,8 +182,6 @@ rather than hidden.
   recurrences parallelize; this is the most-requested gap)
 - **CWT** — scipy *removed* `cwt` in 1.15, so this is a differentiator, not a clone
 - Modern `ShortTimeFFT` class
-- Four-step FFT decomposition in-library to reclaim GPU speed for >2^20 transforms
-  while upstream is broken
 - fp16 mode; real-time streaming API; torchaudio benchmark column
 
 ## Examples

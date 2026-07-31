@@ -162,13 +162,13 @@ def build_cases(quick: bool) -> list[Case]:
     if not quick:
         xl = sig(1 << 23)
         cases.append(Case(
-            "resample (FFT, >1M: CPU-FFT)", "2^23 -> x0.75",
+            "resample (FFT, >1M)", "2^23 -> x0.75",
             lambda x=xl: sps.resample(x, 3 * x.size // 4),
             lambda x=xl: msig.resample(x, 3 * x.size // 4),
             (xl,),
         ))
         cases.append(Case(
-            "hilbert (>1M: CPU-FFT)", "2^23",
+            "hilbert (>1M)", "2^23",
             lambda x=xl: sps.hilbert(x),
             lambda x=xl: msig.hilbert(x),
             (xl,),
