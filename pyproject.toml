@@ -27,6 +27,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5", "hypothesis>=6"]
+# cross-library benchmark competitors (bench/bench_cross.py)
+bench = ["torch", "torchaudio", "librosa", "soxr", "jax"]
 
 [project.urls]
 Homepage = "https://github.com/tabulai/mlx-signal"

@@ -59,6 +59,39 @@ fast path at any length.
 It is included for pipeline completeness (GPU sign-diff prefilter, host refinement)
 and priced honestly at ~1x.
 
+## How it compares beyond scipy
+
+Other Mac-runnable implementations exist for parts of this API: torch/torchaudio
+(CPU and the MPS GPU backend), `jax.scipy.signal` (XLA CPU), librosa, and soxr.
+Same machine, conventions aligned, every output verified against scipy before
+timing (full details: [bench/results/cross.md](bench/results/cross.md), reproduce
+with `pip install -e ".[bench]" && python bench/bench_cross.py`). End-to-end
+(NumPy in/out), best per row in bold:
+
+| task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| welch, 64ch × 2^20 | 490 ms | **28 ms** | — | — | 133 ms | — | — |
+| stft, 16ch × 2^20 | 47 ms | 6.3 ms | 25 ms | **4.0 ms** | 44 ms | 63 ms | — |
+| fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 37 ms | 4.0 ms | 15 ms | — | — |
+| resample 48k→44.1k, 16ch × 2^20 | 120 ms | **6.3 ms**¹ | 8.7 ms¹ | 5.5 ms¹ | — | 56 ms | 52 ms |
+| causal FIR, 64ch × 2^20, 257 taps | 1597 ms | **18 ms** | 3831 ms² | 69 ms² | — | — | — |
+
+¹ Task-level: torchaudio's default anti-aliasing filter (`lowpass_filter_width=6`)
+is far shorter than scipy's/ours (3201 taps here) — mlx-signal matches
+torchaudio-MPS speed while doing ~20x the filter work at scipy-identical quality.
+² torch has no FFT convolution for filtering, so the idiomatic path is direct
+`conv1d` (O(n·k)); torchaudio's `lfilter` (its general IIR machinery) takes
+**3.6 s on CPU and 21.5 s on MPS** for this FIR case — 1200x slower than
+mlx-signal — which is exactly the patchy-MPS-coverage problem this library exists
+to avoid.
+
+Takeaways: nothing else offers GPU `welch`/`csd`/`coherence` (JAX mirrors scipy
+on CPU only; torchaudio has no PSD estimation), `upfirdn` and `find_peaks` are
+scipy-only elsewhere, and the one row another GPU wins — raw `torch.stft` on MPS,
+~1.3x faster — comes as part of a 2 GB torch dependency with the `lfilter` cliff
+above. On-device numbers (arrays already resident) are closer: 3.0 ms mlx-signal
+vs 2.4 ms torch-MPS for that stft.
+
 ## Install
 
 Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
