@@ -187,6 +187,15 @@ def irfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     a = a.astype(mx.complex64) if a.dtype != mx.complex64 else a
     a = mx.moveaxis(a, axis, -1) if axis not in (-1, a.ndim - 1) else a
     X = _pad_last(a, m + 1)
+    # irfft semantics: DC and Nyquist bins are taken as real
+    X = mx.concatenate(
+        [
+            mx.real(X[..., :1]).astype(mx.complex64),
+            X[..., 1:m],
+            mx.real(X[..., m : m + 1]).astype(mx.complex64),
+        ],
+        axis=-1,
+    )
     Xk = X[..., :m]
     xmk = mx.conj(X[..., 1:][..., ::-1])  # conj(X[m-k]) for k = 0..m-1
     E = 0.5 * (Xk + xmk)

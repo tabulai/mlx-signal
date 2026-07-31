@@ -191,6 +191,17 @@ def build_cases(quick: bool) -> list[Case]:
         (x, b),
     ))
 
+    # --- istft (inverse-Stockham + gather-OLA kernel pair) -------------------
+    xst = sig((16, 1 << 20)) if not quick else sig((4, 1 << 18))
+    _, _, zst = sps.stft(xst, nperseg=1024)
+    zst = zst.astype(np.complex64)
+    cases.append(Case(
+        "istft", f"{xst.shape[0]}ch x 2^{int(np.log2(xst.shape[1]))}, nperseg=1024",
+        lambda z=zst: sps.istft(z, nperseg=1024),
+        lambda z=zst: msig.istft(z, nperseg=1024),
+        (zst,),
+    ))
+
     # --- csd / coherence (fused two-signal kernel) ---------------------------
     x = sig((64, 1 << 20)) if not quick else sig((8, 1 << 18))
     y2 = sig(x.shape)
@@ -307,6 +318,8 @@ def _device_variant(case: Case, mx_inputs):
         return lambda: msig.lfilter(a[1], [1.0], a[0], axis=-1)
     if n == "filtfilt (FIR)":
         return lambda: msig.filtfilt(a[1], [1.0], a[0], axis=-1)
+    if n == "istft":
+        return lambda: msig.istft(a[0], nperseg=1024)
     if n == "csd":
         return lambda: msig.csd(a[0], a[1], nperseg=1024)
     if n == "coherence":

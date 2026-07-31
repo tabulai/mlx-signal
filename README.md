@@ -37,6 +37,7 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | coherence | 64ch × 2^20, nperseg=1024 | 1944.9 ms | 17.6 ms | 9.8 ms | **110.5x / 199.2x** |
 | spectrogram | 16ch × 2^20 | 68.7 ms | 6.8 ms | 1.3 ms | **10.1x / 53.7x** |
 | stft | 16ch × 2^20, nperseg=1024 | 81.4 ms | 4.7 ms | 1.3 ms | **17.3x / 63.8x** |
+| istft | 16ch × 2^20, nperseg=1024 | 174.4 ms | 22.9 ms | 3.2 ms | **7.6x / 54.6x** |
 | fftconvolve | 2^20 × 4097 | 11.2 ms | 1.8 ms | 1.5 ms | **6.4x / 7.5x** |
 | fftconvolve | 2^22 × 257 | 47.8 ms | 2.9 ms | 1.7 ms | **16.3x / 27.7x** |
 | oaconvolve | 2^23 × 513 | 27.4 ms | 4.0 ms | 2.7 ms | **6.8x / 10.4x** |
@@ -100,9 +101,12 @@ and it ships inside a 2 GB torch dependency with the `lfilter` cliff above. The
 speed comes from a fused Metal kernel (`_stft_metal.py`): one threadgroup per
 segment runs strided load → mean-detrend → window → a full radix-2 Stockham FFT
 in threadgroup memory — welch's entire per-segment pipeline reads the signal
-once and writes |X|² once, with no frames array ever materialized. Non-pow2 or
-otherwise ineligible shapes use the composed path: zero-copy `as_strided`
-framing, `mx.compile`-fused detrend+window, scaling folded into the window.
+once and writes |X|² once, with no frames array ever materialized. `istft` runs
+the mirror image: a per-segment inverse-Stockham kernel plus a gather-based
+overlap-add (one thread per output sample sums its few overlapping segments —
+no scatters, norm divide folded in). Non-pow2 or otherwise ineligible shapes
+use the composed path: zero-copy `as_strided` framing, `mx.compile`-fused
+detrend+window, scaling folded into the window.
 
 ## Install
 
@@ -120,7 +124,7 @@ python -m pytest -q         # 329 golden tests against scipy and NumPy
 
 | area | functions | notes |
 |---|---|---|
-| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernel on the pow2 hot path (incl. a two-signal csd/coherence variant), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
+| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernels on the pow2 hot path (two-signal csd/coherence variant, inverse+gather-OLA for istft), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; FFT lengths padded to powers of two |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn` (one thread per output sample, taps staged in threadgroup memory) |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and SOS-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up) with scipy-exact edge handling; design host-side |

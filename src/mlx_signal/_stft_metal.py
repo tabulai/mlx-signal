@@ -417,3 +417,144 @@ def csd_frames(x, y, win, nperseg, hop, detrend):
 def coherence_frames(x, y, win, nperseg, hop, detrend):
     """(|Fx|^2, |Fy|^2, conj(Fx)*Fy) per segment in one fused sweep."""
     return _pair_launch(x, y, win, nperseg, hop, detrend, trio=True)
+
+
+# ---------------------------------------------------------------------------
+# inverse: per-segment inverse rfft + windowing, then gather-based overlap-add
+# ---------------------------------------------------------------------------
+
+_ISTFT_SRC = """
+    uint tid = thread_index_in_threadgroup;
+    uint seg = threadgroup_position_in_grid.y;
+    int total = params[0];
+    if ((int)seg >= total) return;
+
+    const device float2* xrow = ((const device float2*)zin) + (long)seg * ({M} + 1);
+    const device float2* twf = (const device float2*)tw;
+    const device float2* utf = (const device float2*)ut;
+
+    threadgroup float2 buf0[{M}];
+    threadgroup float2 buf1[{M}];
+    threadgroup float2* Z;
+
+    // rebuild conj(Z[k]) of the packed even/odd spectrum from X[0..M]:
+    // E = (X[k] + conj(X[M-k]))/2, O = conj(ut[k]) * (X[k] - conj(X[M-k]))/2
+    for (int k = tid; k < {M}; k += {T}) {{
+        float2 Xk  = xrow[k];
+        float2 Xmk = xrow[{M} - k];
+        if (k == 0) {{
+            // irfft semantics: DC and Nyquist bins are taken as real
+            Xk.y = 0.0f;
+            Xmk.y = 0.0f;
+        }}
+        float2 E  = float2(0.5f * (Xk.x + Xmk.x), 0.5f * (Xk.y - Xmk.y));
+        float2 wO = float2(0.5f * (Xk.x - Xmk.x), 0.5f * (Xk.y + Xmk.y));
+        float2 u  = utf[k];
+        float2 O  = cmul(float2(u.x, -u.y), wO);
+        buf0[k] = float2(E.x - O.y, -(E.y + O.x));  // conj(E + i*O)
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+{FFT}
+
+    // z[t] = conj(fft(conj(Z)))[t] / M; the 1/M and the istft scale are folded
+    // into wineff, so this just writes windowed interleaved time samples
+    device float* orow = out + (long)seg * {N};
+    for (int t = tid; t < {M}; t += {T}) {{
+        float2 a = Z[t];
+        orow[2 * t]     =  a.x * wineff[2 * t];
+        orow[2 * t + 1] = -a.y * wineff[2 * t + 1];
+    }}
+"""
+
+_OLA_SRC = """
+    uint i = thread_position_in_grid.x;
+    uint b = thread_position_in_grid.y;
+    int outlen = params[0];
+    int nseg   = params[1];
+    int hop    = params[2];
+    int B      = params[3];
+    if ((int)i >= outlen || (int)b >= B) return;
+
+    int s_hi = min(nseg - 1, (int)i / hop);
+    int s_lo = ((int)i >= {N}) ? (((int)i - {N}) / hop + 1) : 0;
+
+    float acc = 0.0f;
+    float nrm = 0.0f;
+    const device float* srow = segs + (long)b * nseg * {N};
+    for (int s = s_lo; s <= s_hi; ++s) {{
+        int off = (int)i - s * hop;
+        acc += srow[(long)s * {N} + off];
+        float wv = win[off];
+        nrm += wv * wv;
+    }}
+    out[(long)b * outlen + i] = acc / (nrm > 1e-10f ? nrm : 1.0f);
+    if (b == 0) normout[i] = nrm;
+"""
+
+
+def eligible_istft(nperseg: int) -> bool:
+    """True if the inverse kernel pair can run this one-sided istft."""
+    if not (mx.metal.is_available() and hasattr(mx, "view")):
+        return False
+    return _MIN_N <= nperseg <= _MAX_N and not (nperseg & (nperseg - 1))
+
+
+@functools.lru_cache(maxsize=32)
+def _istft_kernels(N: int):
+    M = N // 2
+    S = int(math.log2(M))
+    T = min(256, max(32, M // 2))
+    inv = mx.fast.metal_kernel(
+        name=f"mlx_signal_istft_{N}",
+        input_names=["zin", "wineff", "tw", "ut", "params"],
+        output_names=["out"],
+        source=_ISTFT_SRC.format(N=N, M=M, T=T, FFT=_PAIR_FFT.format(M=M, S=S, T=T)),
+        header=_HEADER.format(M=M),
+    )
+    ola = mx.fast.metal_kernel(
+        name=f"mlx_signal_ola_{N}",
+        input_names=["segs", "win", "params"],
+        output_names=["out", "normout"],
+        source=_OLA_SRC.format(N=N),
+    )
+    return inv, ola, T, M
+
+
+def istft_frames(z3: mx.array, win_np, scale: float, nperseg: int, hop: int):
+    """One-sided istft core: (..., nseg, M+1) spectra -> (..., outlen) signal.
+
+    Returns ``(x, norm)`` where ``x`` is already divided by the window-power
+    norm (scipy's exact where(norm > 1e-10, norm, 1) rule) and ``norm`` is the
+    1-D window-power array for the caller's NOLA check.
+    """
+    M = nperseg // 2
+    nseg = z3.shape[-2]
+    batch_shape = z3.shape[:-2]
+    z2 = z3.reshape(-1, nseg, M + 1)
+    B = z2.shape[0]
+    total = B * nseg
+    outlen = nperseg + (nseg - 1) * hop
+
+    inv, ola, T, _ = _istft_kernels(nperseg)
+    tw, ut = _tables(nperseg)
+    win_eff = mx.array((np.asarray(win_np, dtype=np.float64) * (scale / M))
+                       .astype(np.float32))
+    win_raw = mx.array(np.asarray(win_np, dtype=np.float32))
+
+    z_f = mx.view(z2.reshape(total, M + 1), mx.float32)
+    (segs,) = inv(
+        inputs=[z_f, win_eff, tw, ut, mx.array([total], dtype=mx.int32)],
+        grid=(T, total, 1),
+        threadgroup=(T, 1, 1),
+        output_shapes=[(total, nperseg)],
+        output_dtypes=[mx.float32],
+    )
+    out, norm = ola(
+        inputs=[segs, win_raw, mx.array([outlen, nseg, hop, B], dtype=mx.int32)],
+        grid=(outlen, B, 1),
+        threadgroup=(min(256, max(32, outlen)), 1, 1),
+        output_shapes=[(B, outlen), (outlen,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return out.reshape(batch_shape + (outlen,)), norm

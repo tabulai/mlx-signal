@@ -832,29 +832,50 @@ def istft(
         if win_np.shape[0] != nperseg:
             raise ValueError(f"window must have length of {nperseg}")
 
-    ifunc = _sfft.irfft if input_onesided else _sfft.ifft
-    xsubs = ifunc(zxx, n=nfft, axis=-2)[..., :nperseg, :]
-
     if scaling == "spectrum":
-        xsubs = xsubs * mx.array(float(win_np.sum()), dtype=mx.float32)
+        scale = float(win_np.sum())
     elif scaling == "psd":
-        xsubs = xsubs * mx.array(float(np.sqrt(fs * (win_np**2).sum())), dtype=mx.float32)
+        scale = float(np.sqrt(fs * (win_np**2).sum()))
     else:
         raise ValueError(f"Parameter {scaling=} not in ['spectrum', 'psd']!")
 
     outputlength = nperseg + (nseg - 1) * nstep
-    win = mx.array(win_np.astype(np.float32))
-    xsubs_t = mx.swapaxes(xsubs, -2, -1) * win  # (..., nseg, nperseg)
-    x = _overlap_add(xsubs_t, outputlength, nstep)
+    divided = False
+    if input_onesided and nfft == nperseg and _stft_metal.eligible_istft(nperseg):
+        # fused pair: per-segment inverse Stockham rfft + windowing in one
+        # kernel, then gather-based overlap-add (with the norm divide folded in)
+        m1 = nperseg // 2 + 1
+        nf = zxx.shape[-2]
+        if nf > m1:
+            z = zxx[..., :m1, :]
+        elif nf < m1:
+            z = mx.concatenate(
+                [zxx, mx.zeros(zxx.shape[:-2] + (m1 - nf, nseg), dtype=zxx.dtype)],
+                axis=-2,
+            )
+        else:
+            z = zxx
+        x, norm = _stft_metal.istft_frames(
+            mx.swapaxes(z, -2, -1), win_np, scale, nperseg, nstep
+        )
+        divided = True
+    else:
+        ifunc = _sfft.irfft if input_onesided else _sfft.ifft
+        xsubs = ifunc(zxx, n=nfft, axis=-2)[..., :nperseg, :]
+        xsubs = xsubs * mx.array(scale, dtype=mx.float32)
 
-    w2 = win * win
-    pos = (
-        (nstep * mx.arange(nseg, dtype=mx.int32))[:, None]
-        + mx.arange(nperseg, dtype=mx.int32)[None, :]
-    ).reshape(-1)
-    norm = mx.zeros((outputlength,)).at[pos].add(
-        mx.broadcast_to(w2[None, :], (nseg, nperseg)).reshape(-1)
-    )
+        win = mx.array(win_np.astype(np.float32))
+        xsubs_t = mx.swapaxes(xsubs, -2, -1) * win  # (..., nseg, nperseg)
+        x = _overlap_add(xsubs_t, outputlength, nstep)
+
+        w2 = win * win
+        pos = (
+            (nstep * mx.arange(nseg, dtype=mx.int32))[:, None]
+            + mx.arange(nperseg, dtype=mx.int32)[None, :]
+        ).reshape(-1)
+        norm = mx.zeros((outputlength,)).at[pos].add(
+            mx.broadcast_to(w2[None, :], (nseg, nperseg)).reshape(-1)
+        )
 
     if boundary:
         x = x[..., nperseg // 2 : -(nperseg // 2)]
@@ -867,10 +888,10 @@ def istft(
             + (" Possibly due to missing boundary" if not boundary else ""),
             stacklevel=2,
         )
-    x = x / mx.where(norm > 1e-10, norm, mx.ones_like(norm))
-
-    if input_onesided:
-        x = mx.real(x)
+    if not divided:
+        x = x / mx.where(norm > 1e-10, norm, mx.ones_like(norm))
+        if input_onesided:
+            x = mx.real(x)
 
     n_out = x.shape[-1]
     if x.ndim > 1 and time_axis != zxx.ndim - 1:

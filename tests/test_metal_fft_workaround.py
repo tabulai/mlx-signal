@@ -129,3 +129,28 @@ def test_fused_stft_kernel_matches_composed_path(rng):
         np.testing.assert_allclose(
             np.array(fused_p), ref_p, rtol=1e-4, atol=1e-5 * ref_p.max()
         )
+
+
+@pytest.mark.gpu
+def test_istft_kernel_matches_composed_path(rng, monkeypatch):
+    """The inverse-Stockham + gather-OLA pair vs the scatter-based mx path."""
+    import mlx.core as mx
+
+    import mlx_signal as msig
+    from mlx_signal import _stft_metal
+
+    if not _stft_metal.eligible_istft(1024):
+        pytest.skip("no Metal GPU")
+
+    for nperseg, noverlap, shape in [(1024, 512, (4000,)), (256, 192, (3, 8000)),
+                                     (512, 256, (2, 3, 6000))]:
+        x = rng.standard_normal(shape).astype(np.float32)
+        _, _, z = sps.stft(x, nperseg=nperseg, noverlap=noverlap)
+        t_k, x_k = msig.istft(z, nperseg=nperseg, noverlap=noverlap)
+        with monkeypatch.context() as mp:
+            mp.setattr(_stft_metal, "eligible_istft", lambda n: False)
+            t_c, x_c = msig.istft(z, nperseg=nperseg, noverlap=noverlap)
+        np.testing.assert_allclose(
+            np.array(x_k), np.array(x_c), rtol=1e-4,
+            atol=1e-5 * float(mx.max(mx.abs(x_c))),
+        )
