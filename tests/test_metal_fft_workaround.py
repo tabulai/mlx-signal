@@ -92,3 +92,40 @@ def test_large_fft_values_correct_via_wrappers(rng):
     got2 = np.array(_fft_core.rfft(mx.array(x2)))
     rel2 = np.max(np.abs(got2 - ref2)) / np.max(np.abs(ref2))
     assert rel2 < 1e-4
+
+
+@pytest.mark.gpu
+def test_fused_stft_kernel_matches_composed_path(rng):
+    """The Stockham kernel and the as_strided+rfft path are independent."""
+    import mlx.core as mx
+
+    from mlx_signal import _stft_metal
+    from mlx_signal.spectral import _detrend_and_window, _frame_view
+
+    if not (mx.metal.is_available() and hasattr(mx, "view")):
+        pytest.skip("no Metal GPU")
+
+    for n, N, hop, detrend in [
+        (5000, 256, 100, False),
+        (5000, 256, 100, "constant"),
+        (40000, 1024, 512, "constant"),
+        (40000, 2048, 320, False),
+        (3000, 64, 7, "constant"),
+    ]:
+        x = mx.array(rng.standard_normal((3, n)).astype(np.float32))
+        win = mx.array(rng.standard_normal(N).astype(np.float32))
+        nseg = (n - N) // hop + 1
+
+        composed = mx.fft.rfft(
+            _detrend_and_window(_frame_view(x, nseg, N, hop), detrend, win), axis=-1
+        )
+        fused = _stft_metal.rfft_frames(x, win, N, hop, detrend, power=False)
+        np.testing.assert_allclose(
+            np.array(fused), np.array(composed), rtol=1e-4,
+            atol=1e-5 * float(mx.max(mx.abs(composed))),
+        )
+        fused_p = _stft_metal.rfft_frames(x, win, N, hop, detrend, power=True)
+        ref_p = np.abs(np.array(composed)) ** 2
+        np.testing.assert_allclose(
+            np.array(fused_p), ref_p, rtol=1e-4, atol=1e-5 * ref_p.max()
+        )

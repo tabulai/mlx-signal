@@ -20,6 +20,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
+from . import _stft_metal
 from ._array import input_size, result_to_mlx, to_mlx, to_numpy
 from ._arraytools import const_ext, even_ext, odd_ext, zero_ext
 from ._config import capability_fallback, use_mlx
@@ -68,22 +69,38 @@ def _triage_segments(window, nperseg, input_length):
     return win_np, nperseg
 
 
-def _detrend_segments(d: mx.array, kind) -> mx.array:
-    """Detrend each length-nperseg segment (last axis) in one vectorized shot."""
+# mx.compile fuses the elementwise detrend/window chains into single kernels,
+# turning two or three full passes over the frames array into one. Compiled
+# callables cache per input shape/dtype signature.
+_fused_window = mx.compile(lambda d, w: d * w)
+_fused_const_window = mx.compile(lambda d, w: (d - mx.mean(d, axis=-1, keepdims=True)) * w)
+
+
+def _linear_window(d, t, t_over_denom, w):
+    m = mx.mean(d, axis=-1, keepdims=True)
+    slope = mx.sum(d * t_over_denom, axis=-1, keepdims=True)
+    return (d - m - slope * t) * w
+
+
+_fused_linear_window = mx.compile(_linear_window)
+_fused_power = mx.compile(lambda z: mx.square(mx.abs(z)))
+
+
+def _detrend_and_window(d: mx.array, kind, win: mx.array) -> mx.array:
+    """Detrend each length-nperseg segment and apply the window, fused."""
     if kind is False or kind is None:
-        return d
+        return _fused_window(d, win)
     if not isinstance(kind, str):
         raise ValueError("Trend type must be 'linear' or 'constant'.")
     if kind in ("constant", "c"):
-        return d - mx.mean(d, axis=-1, keepdims=True)
+        return _fused_const_window(d, win)
     if kind in ("linear", "l"):
         n = d.shape[-1]
-        t = mx.arange(n, dtype=mx.float32) - (n - 1) / 2.0
         denom = n * (n * n - 1) / 12.0  # sum of centered t**2
         if denom == 0.0:  # n == 1: mean removal is exact
-            return d - mx.mean(d, axis=-1, keepdims=True)
-        slope = mx.sum(d * t, axis=-1, keepdims=True) / denom
-        return d - mx.mean(d, axis=-1, keepdims=True) - slope * t
+            return _fused_const_window(d, win)
+        t = mx.arange(n, dtype=mx.float32) - (n - 1) / 2.0
+        return _fused_linear_window(d, t, t / denom, win)
     raise ValueError("Trend type must be 'linear' or 'constant'.")
 
 
@@ -107,22 +124,27 @@ def _frame_view(x: mx.array, nseg: int, nperseg: int, nstep: int) -> mx.array:
     return mx.as_strided(x, shape, tuple(strides[:-1] + [nstep, 1]))
 
 
-def _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides):
-    """Frame -> detrend -> window -> batched FFT. Returns (..., nseg, nfreq).
+def _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides, want_power=False):
+    """Frame -> detrend -> window -> batched FFT. Returns (result, is_power).
 
     ``win`` arrives with sqrt(scale) already folded in (see _spectral_helper),
-    so no post-FFT scaling pass is needed.
+    so no post-FFT scaling pass is needed. On the eligible hot path (real
+    input, one-sided, pow2 nperseg, constant/no detrend) the whole pipeline
+    runs as one fused Metal kernel; with ``want_power`` it emits |F|^2
+    directly and ``is_power`` is True.
     """
+    if _stft_metal.eligible(x, nperseg, nfft, sides, detrend):
+        out = _stft_metal.rfft_frames(x, win, nperseg, nstep, detrend, power=want_power)
+        return out, want_power
     n = x.shape[-1]
     nseg = (n - nperseg) // nstep + 1
     frames = _frame_view(x, nseg, nperseg, nstep)
-    frames = _detrend_segments(frames, detrend)
-    frames = frames * win
+    frames = _detrend_and_window(frames, detrend, win)
     if sides == "onesided":
-        return _sfft.rfft(frames, n=nfft, axis=-1)
+        return _sfft.rfft(frames, n=nfft, axis=-1), False
     if frames.dtype != mx.complex64:
         frames = frames.astype(mx.complex64)
-    return _sfft.fft(frames, n=nfft, axis=-1)
+    return _sfft.fft(frames, n=nfft, axis=-1), False
 
 
 @functools.lru_cache(maxsize=64)
@@ -292,13 +314,15 @@ def _spectral_helper(
     # full-size post-FFT multiply pass in every mode.
     win = mx.array((win_np * np.sqrt(scale)).astype(np.float32))
 
-    fx = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides)
+    want_power = same_data and mode == "psd"
+    fx, is_power = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides,
+                               want_power=want_power)
     if not same_data:
-        fy = _fft_frames(y, win, detrend, nperseg, nstep, nfft, sides)
+        fy, _ = _fft_frames(y, win, detrend, nperseg, nstep, nfft, sides)
         result = mx.conj(fx) * fy
     elif mode == "psd":
-        a = mx.abs(fx)
-        result = a * a  # real float32, == (conj(F) * F).real
+        # |F|^2: either straight from the fused kernel, or one compiled pass
+        result = fx if is_power else _fused_power(fx)
     else:
         result = fx
 

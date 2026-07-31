@@ -30,11 +30,11 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
 |---|---|---:|---:|---:|---:|
-| welch | 64ch × 2^20, nperseg=1024 | 482.3 ms | 18.0 ms | 13.9 ms | **26.8x / 34.7x** |
-| welch | 1ch × 2^22, nperseg=4096 | 47.6 ms | 1.8 ms | 0.8 ms | **26.7x / 57.2x** |
-| welch | 256ch × 2^16, nperseg=256 | 111.9 ms | 5.0 ms | 3.6 ms | **22.2x / 31.4x** |
-| spectrogram | 16ch × 2^20 | 67.3 ms | 7.3 ms | 3.7 ms | **9.2x / 18.1x** |
-| stft | 16ch × 2^20, nperseg=1024 | 78.3 ms | 6.1 ms | 1.8 ms | **12.9x / 44.8x** |
+| welch | 64ch × 2^20, nperseg=1024 | 495.0 ms | 8.5 ms | 4.3 ms | **58.5x / 115.0x** |
+| welch | 1ch × 2^22, nperseg=4096 | 49.6 ms | 1.9 ms | 1.3 ms | **25.9x / 39.3x** |
+| welch | 256ch × 2^16, nperseg=256 | 115.0 ms | 4.7 ms | 1.1 ms | **24.3x / 106.1x** |
+| spectrogram | 16ch × 2^20 | 68.7 ms | 6.8 ms | 1.3 ms | **10.1x / 53.7x** |
+| stft | 16ch × 2^20, nperseg=1024 | 81.4 ms | 4.7 ms | 1.3 ms | **17.3x / 63.8x** |
 | fftconvolve | 2^20 × 4097 | 11.2 ms | 1.8 ms | 1.5 ms | **6.4x / 7.5x** |
 | fftconvolve | 2^22 × 257 | 47.8 ms | 2.9 ms | 1.7 ms | **16.3x / 27.7x** |
 | oaconvolve | 2^23 × 513 | 27.4 ms | 4.0 ms | 2.7 ms | **6.8x / 10.4x** |
@@ -71,7 +71,7 @@ with `pip install -e ".[bench]" && python bench/bench_cross.py`). End-to-end
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | welch, 64ch × 2^20 | 501 ms | **18 ms** | — | — | 137 ms | — | — |
-| stft, 16ch × 2^20 | 46 ms | 5.7 ms | 25 ms | **4.9 ms** | 46 ms | 64 ms | — |
+| stft, 16ch × 2^20 | 46 ms | 7.2 ms | 26 ms | **4.2 ms** | 43 ms | 65 ms | — |
 | fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 39 ms | 4.6 ms | 16 ms | — | — |
 | resample 48k→44.1k, 16ch × 2^20 | 122 ms | **6.6 ms**¹ | 8.7 ms¹ | 5.8 ms¹ | — | 56 ms | 53 ms |
 | causal FIR, 64ch × 2^20, 257 taps | 1633 ms | **17 ms** | 2885 ms² | 70 ms² | — | — | — |
@@ -87,12 +87,16 @@ to avoid.
 
 Takeaways: nothing else offers GPU `welch`/`csd`/`coherence` (JAX mirrors scipy
 on CPU only; torchaudio has no PSD estimation), and `upfirdn`/`find_peaks` are
-scipy-only elsewhere. The one column that competes — `torch.stft` on MPS — edges
-mlx-signal end-to-end (its NumPy↔GPU transfer is cheaper) but loses on-device,
-where the actual transform runs 2x faster here (1.4 ms vs 3.1 ms); and it ships
-inside a 2 GB torch dependency with the `lfilter` cliff above. The spectral core
-frames segments as zero-copy strided views and folds all scaling into the window
-before the FFT, so an stft is just two memory passes: windowed-gather, then FFT.
+scipy-only elsewhere. The one column that competes — `torch.stft` on MPS — still
+edges mlx-signal end-to-end (its NumPy↔GPU transfer is cheaper) but loses badly
+on-device, where the transform itself runs 3.5x faster here (0.96 ms vs 3.4 ms);
+and it ships inside a 2 GB torch dependency with the `lfilter` cliff above. The
+speed comes from a fused Metal kernel (`_stft_metal.py`): one threadgroup per
+segment runs strided load → mean-detrend → window → a full radix-2 Stockham FFT
+in threadgroup memory — welch's entire per-segment pipeline reads the signal
+once and writes |X|² once, with no frames array ever materialized. Non-pow2 or
+otherwise ineligible shapes use the composed path: zero-copy `as_strided`
+framing, `mx.compile`-fused detrend+window, scaling folded into the window.
 
 ## Install
 
@@ -110,7 +114,7 @@ python -m pytest -q         # 274 golden tests against scipy
 
 | area | functions | notes |
 |---|---|---|
-| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared batched-FFT core; all windows, detrend, scaling, axis, median averaging |
+| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernel on the pow2 hot path, batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; FFT lengths padded to powers of two |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn` (one thread per output sample, taps staged in threadgroup memory) |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `hilbert` | FIR paths on GPU with scipy-exact edge handling; design host-side |
@@ -176,7 +180,7 @@ rather than hidden.
 - **IIR via associative scan** (batched `lfilter`/`sosfilt` — first-order linear
   recurrences parallelize; this is the most-requested gap)
 - **CWT** — scipy *removed* `cwt` in 1.15, so this is a differentiator, not a clone
-- Modern `ShortTimeFFT` class; `mx.compile` fusion of window/scale/magnitude chains
+- Modern `ShortTimeFFT` class
 - Four-step FFT decomposition in-library to reclaim GPU speed for >2^20 transforms
   while upstream is broken
 - fp16 mode; real-time streaming API; torchaudio benchmark column
