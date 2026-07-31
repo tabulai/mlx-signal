@@ -120,10 +120,10 @@ python -m pytest -q         # 329 golden tests against scipy and NumPy
 
 | area | functions | notes |
 |---|---|---|
-| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernel on the pow2 hot path, batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
+| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernel on the pow2 hot path (incl. a two-signal csd/coherence variant), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; FFT lengths padded to powers of two |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn` (one thread per output sample, taps staged in threadgroup memory) |
-| filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and batched-IIR paths on GPU with scipy-exact edge handling; design host-side |
+| filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and SOS-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up) with scipy-exact edge handling; design host-side |
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
 | utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
 
@@ -159,8 +159,8 @@ with sig.config_context(gpu_min_size=1 << 18):  # scoped
     ...
 ```
 
-Capability fallbacks (IIR, exotic padding modes, callable detrend) warn loudly;
-size-based routing is silent by design.
+Capability fallbacks (transfer-function IIR, exotic padding modes, callable
+detrend) warn loudly; size-based routing is silent by design.
 
 ## Dtype policy
 
@@ -185,7 +185,8 @@ rather than hidden.
   upstream to `ml-explore/mlx` if you can reproduce it.)
 - Windows/filter design (`get_window`, `firwin*`) and `find_peaks` refinement run
   host-side — tiny work, and it keeps exact scipy parity.
-- `lfilter`/`filtfilt` don't take `zi` on the GPU path yet (falls back, warns).
+- `lfilter`/`filtfilt` don't take `zi` on the GPU path yet (falls back, warns);
+  `sosfilt` takes and returns its `zi`/`zf` state natively on the GPU.
 - `upfirdn` supports the default zero-padded `mode="constant"` on the GPU; other
   signal-extension modes fall back.
 - Streaming/chunked APIs, `ShortTimeFFT`, and CWT are not yet implemented (below).
@@ -223,7 +224,7 @@ backend covers every path except the custom Metal kernel (marked `gpu`).
 ## Acknowledgments
 
 - **SciPy** — the API contract and the golden reference. Edge-case semantics were
-  matched against scipy.signal (BSD-3-Clause) and are verified by 274 parity tests.
+  matched against scipy.signal (BSD-3-Clause) and are verified by 329 parity tests.
 - **cuSignal** (RAPIDS) — validated the "keep the scipy API, swap the array
   library, add custom kernels where it counts" playbook this project follows.
 - **MLX** — the lazy, unified-memory array framework that makes the zero-copy
