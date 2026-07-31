@@ -8,4 +8,3 @@ build/
 .ruff_cache/
 .hypothesis/
 .DS_Store
-bench/results/

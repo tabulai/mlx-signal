@@ -64,7 +64,7 @@ and priced honestly at ~1x.
 Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 
 ```bash
-git clone https://github.com/tunguz/mlx-signal && cd mlx-signal
+git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
 python -m pytest -q         # 274 golden tests against scipy
 ```
