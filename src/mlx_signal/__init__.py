@@ -16,7 +16,7 @@ from ._config import (
 )
 from ._fft import next_fast_len
 from .convolution import convolve, correlate, correlation_lags, fftconvolve, oaconvolve
-from .filtering import filtfilt, firwin, firwin2, hilbert, lfilter
+from .filtering import filtfilt, firwin, firwin2, hilbert, lfilter, sosfilt, sosfiltfilt
 from .peaks import find_peaks, peak_prominences, peak_widths
 from .resampling import decimate, resample, resample_poly, upfirdn
 from .spectral import coherence, csd, istft, periodogram, spectrogram, stft, welch
@@ -53,6 +53,8 @@ __all__ = [
     "resample",
     "resample_poly",
     "set_config",
+    "sosfilt",
+    "sosfiltfilt",
     "spectrogram",
     "stft",
     "upfirdn",

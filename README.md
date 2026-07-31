@@ -44,6 +44,8 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | resample (FFT) | 2^20 → 2^18 | 4.3 ms | 0.4 ms | 0.3 ms | **11.0x / 14.4x** |
 | hilbert | 2^20 | 9.9 ms | 0.8 ms | 0.6 ms | **12.9x / 17.9x** |
 | lfilter (FIR) | 64ch × 2^20, 257 taps | 1634.7 ms | 17.7 ms | 9.8 ms | **92.1x / 167.7x** |
+| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1307.6 ms | 158.9 ms | 128.2 ms | **8.2x / 10.2x** |
+| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2693.9 ms | 602.4 ms | 518.4 ms | **4.5x / 5.2x** |
 | filtfilt (FIR) | 64ch × 2^20, 257 taps | 3271.8 ms | 44.5 ms | 23.6 ms | **73.5x / 138.5x** |
 | resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 66.5 ms | 7.3 ms | 5.5 ms | **9.2x / 12.1x** |
 | hilbert >1M samples¹ | 2^23 | 102.6 ms | 8.1 ms | 6.5 ms | **12.7x / 15.8x** |
@@ -104,7 +106,7 @@ Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 ```bash
 git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # 292 golden tests against scipy and NumPy
+python -m pytest -q         # 327 golden tests against scipy and NumPy
 ```
 
 (PyPI release planned for 0.1.0.)
@@ -116,16 +118,23 @@ python -m pytest -q         # 292 golden tests against scipy and NumPy
 | spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernel on the pow2 hot path, batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; FFT lengths padded to powers of two |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn` (one thread per output sample, taps staged in threadgroup memory) |
-| filtering | `firwin` `firwin2` `lfilter` `filtfilt` `hilbert` | FIR paths on GPU with scipy-exact edge handling; design host-side |
+| filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and batched-IIR paths on GPU with scipy-exact edge handling; design host-side |
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
 | utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
 
-**Deliberately deferred: general IIR.** `lfilter` with `len(a) > 1`, `filtfilt` for
-IIR, `sosfilt`, and `decimate`'s default `ftype="iir"` are recursive — a GPU only
-wins when batched across channels via an associative scan, which is on the roadmap.
-Today those calls fall back to scipy and tell you so with a `FallbackWarning`
-(pass `ftype="fir"` to `decimate` to stay on the GPU). You will not silently run
-on one core believing you're on 40 GPU cores.
+**IIR runs on the GPU when batched.** `sosfilt`/`sosfiltfilt` (and `decimate`'s
+default `ftype="iir"`) run scipy's exact direct-form-II-transposed cascade in a
+custom Metal kernel — one thread per channel, the whole cascade unrolled in
+registers, with native `zi`/`zf` state so streaming chunk-by-chunk works. The
+kernel is bit-identical to scipy executing in float32. An IIR recurrence is
+serial in time, so the win comes from channel count: ~2.8x at 64 channels, 10x
+at 256 (measured, butter-8). Below ~32 channels `dispatch="auto"` routes to
+scipy, where one fast core beats a nearly-empty GPU — block-parallel
+single-channel IIR via associative scan is the roadmap item. `lfilter` with
+`len(a) > 1` (transfer-function form) still falls back to scipy with a
+`FallbackWarning`; use the better-conditioned SOS form, as scipy itself
+recommends. You will not silently run on one core believing you're on 40 GPU
+cores.
 
 ## Dispatch: when the GPU is used
 
@@ -178,8 +187,9 @@ rather than hidden.
 
 ## Roadmap
 
-- **IIR via associative scan** (batched `lfilter`/`sosfilt` — first-order linear
-  recurrences parallelize; this is the most-requested gap)
+- **Single-channel IIR via associative scan** (`sosfilt` is GPU-batched across
+  channels today; block-parallel scan would win the few-channel case too) and
+  transfer-function `lfilter` IIR
 - **CWT** — scipy *removed* `cwt` in 1.15, so this is a differentiator, not a clone
 - Modern `ShortTimeFFT` class
 - fp16 mode; real-time streaming API; torchaudio benchmark column

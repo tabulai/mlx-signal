@@ -14,10 +14,10 @@ import numpy as np
 from . import _fft_core as _sfft
 from ._array import input_size, result_to_mlx, to_mlx, to_numpy
 from ._arraytools import const_ext, even_ext, odd_ext
-from ._config import capability_fallback, use_mlx
+from ._config import capability_fallback, get_config, use_mlx
 from .convolution import oaconvolve
 
-__all__ = ["filtfilt", "firwin", "firwin2", "hilbert", "lfilter"]
+__all__ = ["filtfilt", "firwin", "firwin2", "hilbert", "lfilter", "sosfilt", "sosfiltfilt"]
 
 
 def hilbert(x, N=None, axis=-1):
@@ -213,4 +213,209 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
         y = y[..., padlen : padlen + n]
     if moved:
         y = mx.moveaxis(y, -1, axis)
+    return y
+
+
+# ---------------------------------------------------------------------------
+# IIR: second-order sections (batched-channel GPU kernel)
+# ---------------------------------------------------------------------------
+
+#: under dispatch="auto", the per-channel-sequential kernel needs at least this
+#: many rows to beat scipy's single-core loop (measured crossover on M4 Max:
+#: the kernel is latency-bound at ~100 ms per 2^20 samples regardless of
+#: channel count; scipy scales linearly at ~5 ms per channel)
+_SOSFILT_MIN_ROWS = 32
+
+
+def _validate_sos_np(sos) -> np.ndarray:
+    sos = np.atleast_2d(np.asarray(to_numpy(sos)))
+    if sos.ndim != 2:
+        raise ValueError("sos array must be 2D")
+    if sos.shape[1] != 6:
+        raise ValueError("sos array must be shape (n_sections, 6)")
+    if not np.all(sos[:, 3] == 1):
+        raise ValueError("sos[:, 3] should be all ones")
+    return sos
+
+
+def _zi_expected_shape(n_sections, x_shape, axis):
+    shape = list(x_shape)
+    shape[axis] = 2
+    return (n_sections, *shape)
+
+
+def sosfilt(sos, x, axis=-1, zi=None):
+    """Filter data along one dimension using cascaded second-order sections.
+
+    scipy-compatible (direct form II transposed, identical ``zi``/``zf``
+    contract). On the GPU one thread runs one channel's recurrence with the
+    whole cascade unrolled in registers, so batched multichannel IIR runs in
+    parallel; with fewer than ~32 channels under ``dispatch="auto"`` the call
+    routes to scipy, where a single fast core wins (block-parallel
+    single-channel IIR via associative scan is on the roadmap). Coefficients
+    are applied in float32 (like every array in this library) — well within
+    tolerance for SOS cascades of reasonable Q, which is exactly what the SOS
+    factorization is for.
+    """
+    from . import _sosfilt_metal
+
+    sos_np = _validate_sos_np(sos)
+    n_sections = sos_np.shape[0]
+    xa = to_mlx(x)
+    if xa.ndim < 1 or xa.shape[axis] == 0:
+        raise ValueError("x must be at least 1-D with samples along axis")
+    n = xa.shape[axis]
+    batch = xa.size // n
+
+    if zi is not None:
+        zi_a = to_mlx(zi)
+        expected = _zi_expected_shape(n_sections, xa.shape, axis % xa.ndim)
+        if tuple(zi_a.shape) != expected:
+            raise ValueError(
+                f"Invalid zi shape. With axis={axis!r}, an input with shape "
+                f"{tuple(xa.shape)}, and an sos array with {n_sections} "
+                f"sections, zi must have shape {expected}, got {tuple(zi_a.shape)}."
+            )
+
+    complex_sos = np.iscomplexobj(sos_np)
+    kernel_ok = (
+        mx.metal.is_available()
+        and not complex_sos
+        and n_sections <= _sosfilt_metal.MAX_SECTIONS
+    )
+
+    def _scipy_path():
+        import scipy.signal as sps
+
+        out = sps.sosfilt(sos_np, to_numpy(x), axis=axis,
+                          zi=to_numpy(zi) if zi is not None else None)
+        if zi is not None:
+            return result_to_mlx(out[0]), result_to_mlx(out[1])
+        return result_to_mlx(out)
+
+    if not use_mlx(xa.size * n_sections):
+        return _scipy_path()
+    if not kernel_ok:
+        reason = ("complex sos coefficients" if complex_sos
+                  else f"more than {_sosfilt_metal.MAX_SECTIONS} sections"
+                  if n_sections > _sosfilt_metal.MAX_SECTIONS
+                  else "no Metal GPU")
+        capability_fallback("sosfilt", reason)
+        return _scipy_path()
+    if get_config().dispatch == "auto" and batch < _SOSFILT_MIN_ROWS:
+        # few channels: scipy's single fast core beats a near-empty GPU
+        return _scipy_path()
+
+    sos_flat = mx.array(np.ascontiguousarray(sos_np, dtype=np.float32).reshape(-1))
+
+    ax = axis % xa.ndim
+    moved = xa.ndim > 1 and ax != xa.ndim - 1
+    if moved:
+        xa = mx.moveaxis(xa, ax, -1)
+    batch_shape = xa.shape[:-1]
+    x2 = xa.reshape(-1, n)
+
+    if zi is not None:
+        # (S, ..., 2-at-axis) -> (B, S, 2)
+        zi_m = zi_a
+        if moved:
+            zi_m = mx.moveaxis(zi_m, ax + 1, -1)
+        zi_m = mx.moveaxis(zi_m, 0, -2)  # (..., S, 2)
+        zi2 = zi_m.reshape(-1, n_sections, 2)
+    else:
+        zi2 = mx.zeros((x2.shape[0], n_sections, 2))
+
+    if x2.dtype == mx.complex64:
+        if zi is not None and zi2.dtype != mx.complex64:
+            zi2 = zi2.astype(mx.complex64)
+        yr, zr = _sosfilt_metal.sosfilt_gpu(mx.real(x2), sos_flat, mx.real(zi2))
+        yi, zim = _sosfilt_metal.sosfilt_gpu(mx.imag(x2), sos_flat, mx.imag(zi2))
+        j = mx.array(1j)
+        y2 = yr.astype(mx.complex64) + yi.astype(mx.complex64) * j
+        zf2 = zr.astype(mx.complex64) + zim.astype(mx.complex64) * j
+    else:
+        if zi is not None and zi2.dtype == mx.complex64:
+            raise ValueError("complex zi requires complex x")
+        y2, zf2 = _sosfilt_metal.sosfilt_gpu(x2, sos_flat, zi2)
+
+    y = y2.reshape(batch_shape + (n,))
+    if moved:
+        y = mx.moveaxis(y, -1, ax)
+    if zi is None:
+        return y
+    zf = zf2.reshape(batch_shape + (n_sections, 2))
+    zf = mx.moveaxis(zf, -2, 0)  # (S, ..., 2)
+    if moved:
+        zf = mx.moveaxis(zf, -1, ax + 1)
+    return y, zf
+
+
+def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
+    """Zero-phase forward-backward IIR filtering with second-order sections.
+
+    scipy-compatible port: odd/even/constant edge extension, ``sosfilt_zi``
+    steady-state initialization scaled by the edge samples, forward and
+    reverse passes, trim. Both passes run through :func:`sosfilt`, so the GPU
+    kernel (or the scipy routing) applies to each.
+    """
+    sos_np = _validate_sos_np(sos)
+    n_sections = sos_np.shape[0]
+
+    if not use_mlx(input_size(x) * n_sections):
+        import scipy.signal as sps
+
+        return result_to_mlx(
+            sps.sosfiltfilt(sos_np, to_numpy(x), axis=axis, padtype=padtype,
+                            padlen=padlen)
+        )
+
+    if padtype not in ("even", "odd", "constant", None):
+        raise ValueError(
+            f"Unknown value '{padtype}' given to padtype. padtype must be 'even', "
+            "'odd', 'constant', or None."
+        )
+
+    ntaps = 2 * n_sections + 1
+    ntaps -= min(int((sos_np[:, 2] == 0).sum()), int((sos_np[:, 5] == 0).sum()))
+    if padtype is None:
+        edge = 0
+    elif padlen is None:
+        edge = ntaps * 3
+    else:
+        edge = int(padlen)
+
+    xa = to_mlx(x)
+    ax = axis % xa.ndim
+    if xa.shape[ax] <= edge:
+        raise ValueError(
+            f"The length of the input vector x must be greater than padlen, "
+            f"which is {edge}."
+        )
+
+    moved = xa.ndim > 1 and ax != xa.ndim - 1
+    if moved:
+        xa = mx.moveaxis(xa, ax, -1)
+
+    if edge > 0:
+        ext_func = {"even": even_ext, "odd": odd_ext, "constant": const_ext}[padtype]
+        ext = ext_func(xa, edge)
+    else:
+        ext = xa
+
+    from scipy.signal import sosfilt_zi as _sosfilt_zi
+
+    zi_np = np.asarray(_sosfilt_zi(sos_np), dtype=np.float64)  # (S, 2)
+    zi_shape = [1] * ext.ndim
+    zi_shape[-1] = 2
+    zi = mx.array(zi_np.astype(np.float32)).reshape([n_sections] + zi_shape)
+
+    x_0 = ext[..., :1]
+    y, _ = sosfilt(sos_np, ext, axis=-1, zi=zi * x_0)
+    y_0 = y[..., -1:]
+    y, _ = sosfilt(sos_np, y[..., ::-1], axis=-1, zi=zi * y_0)
+    y = y[..., ::-1]
+    if edge > 0:
+        y = y[..., edge:-edge]
+    if moved:
+        y = mx.moveaxis(y, -1, ax)
     return y

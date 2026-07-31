@@ -168,12 +168,19 @@ def test_decimate_fir_custom_order_axis(rng):
     assert_close(out, ref, rtol=2e-4)
 
 
-def test_decimate_iir_falls_back(rng):
+def test_decimate_iir_matches_scipy(rng):
     x = rng.standard_normal(1000).astype(np.float32)
+    out = msig.decimate(x, 4)  # default ftype="iir", GPU sosfiltfilt path
+    assert_close(out, sps.decimate(x, 4), rtol=1e-3, atol_frac=1e-4)
+    assert_type_and_dtype(out)
+
+
+def test_decimate_dlti_falls_back(rng):
+    x = rng.standard_normal(1000).astype(np.float32)
+    system = sps.dlti(*sps.cheby1(6, 0.05, 0.2))
     with msig.config_context(dispatch="auto", gpu_min_size=1):
         with pytest.warns(msig.FallbackWarning):
-            out = msig.decimate(x, 4)
-    assert_close(out, sps.decimate(x, 4), rtol=1e-3)
-    assert_type_and_dtype(out)
+            out = msig.decimate(x, 4, ftype=system)
+    assert_close(out, sps.decimate(x, 4, ftype=system), rtol=1e-3, atol_frac=1e-4)
     with pytest.raises(NotImplementedError):
-        msig.decimate(x, 4)  # dispatch="mlx" pinned by fixture
+        msig.decimate(x, 4, ftype=system)  # dispatch="mlx" pinned by fixture

@@ -331,17 +331,32 @@ def decimate(x, q, n=None, ftype="iir", axis=-1, zero_phase=True):
     """Downsample by an integer factor after an anti-aliasing filter.
 
     scipy-compatible signature. The FIR path (``ftype="fir"``) runs on the GPU
-    (a hamming-window ``firwin(20*q+1, 1/q)`` filter applied via upfirdn).
-    scipy's default ``ftype="iir"`` requires recursive filtering, which is
-    deferred in mlx-signal v0.1 — it falls back to scipy with a
-    FallbackWarning. Pass ``ftype="fir"`` to stay on the GPU.
+    (a hamming-window ``firwin(20*q+1, 1/q)`` filter applied via upfirdn); the
+    default ``ftype="iir"`` (order-8 Chebyshev I) runs through the batched
+    GPU :func:`~mlx_signal.sosfiltfilt`/:func:`~mlx_signal.sosfilt` kernel.
+    ``dlti`` instances fall back to scipy.
     """
     q = int(q)
     if q < 1:
         raise ValueError("q must be a positive integer")
 
+    if ftype == "iir":
+        from scipy.signal import cheby1
+
+        from .filtering import sosfilt, sosfiltfilt
+
+        if n is None:
+            n = 8
+        sos = cheby1(int(n), 0.05, 0.8 / q, output="sos")
+        if zero_phase:
+            y = sosfiltfilt(sos, x, axis=axis)
+        else:
+            y = sosfilt(sos, x, axis=axis)
+        sl = [slice(None)] * y.ndim
+        sl[axis] = slice(None, None, q)
+        return y[tuple(sl)]
     if ftype != "fir":
-        capability_fallback("decimate", f"ftype={ftype!r} (IIR is deferred; use ftype='fir')")
+        capability_fallback("decimate", f"ftype={ftype!r} (dlti systems have no MLX path)")
         import scipy.signal as sps
 
         return result_to_mlx(
