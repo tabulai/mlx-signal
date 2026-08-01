@@ -229,8 +229,6 @@ backend covers every path except the custom Metal kernel (marked `gpu`).
 ## Acknowledgments
 
 - **SciPy** — the API contract and the golden reference. Edge-case semantics were
-  matched against scipy.signal (BSD-3-Clause) and are verified by 329 parity tests.
-- **cuSignal** (RAPIDS) — validated the "keep the scipy API, swap the array
-  library, add custom kernels where it counts" playbook this project follows.
+  matched against scipy.signal (BSD-3-Clause) and are verified by 333 parity tests.
 - **MLX** — the lazy, unified-memory array framework that makes the zero-copy
   story possible.
