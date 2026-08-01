@@ -15,6 +15,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
+from . import _ola_metal
 from ._array import result_to_mlx, to_mlx, to_numpy
 from ._config import use_mlx
 from ._fft import next_fast_len
@@ -130,14 +131,16 @@ def fftconvolve(in1, in2, mode="full", axes=None):
         out = sps.fftconvolve(to_numpy(in1), to_numpy(in2), mode=mode, axes=axes or None)
         return result_to_mlx(out)
 
-    # A long x short convolution whose padded FFT length lands on an MLX-0.32
-    # broken Metal size runs as blocked overlap-add instead (small, fast FFTs).
+    # A long x short convolution runs as blocked overlap-add when the padded
+    # FFT would land on an MLX-0.32 broken Metal size, or is simply big enough
+    # (>= 2^19) that many small block FFTs beat one 2x-padded giant one.
     if len(axes) == 1:
         ax = axes[0]
+        fl = next_fast_len(shape[ax])
         if (
-            _sfft.metal_fft_broken(next_fast_len(shape[ax]))
-            and min(s1[ax], s2[ax]) <= (1 << 16)
+            min(s1[ax], s2[ax]) <= (1 << 16)
             and max(s1[ax], s2[ax]) > (1 << 16)
+            and (_sfft.metal_fft_broken(fl) or fl >= (1 << 19))
         ):
             return oaconvolve(a1, a2, mode=mode, axes=list(axes))
 
@@ -252,17 +255,21 @@ def oaconvolve(in1, in2, mode="full", axes=None):
 
     # overlap-add the per-block full convolutions (each length nblock, hop step)
     full_len = (nblocks - 1) * step + nblock
-    pos = (
-        (step * mx.arange(nblocks, dtype=mx.int32))[:, None]
-        + mx.arange(nblock, dtype=mx.int32)[None, :]
-    ).reshape(-1)
-    v2 = y.reshape((-1, nblocks * nblock))
-    if complex_result:
-        re = mx.zeros((v2.shape[0], full_len)).at[:, pos].add(mx.real(v2))
-        im = mx.zeros((v2.shape[0], full_len)).at[:, pos].add(mx.imag(v2))
-        out = re.astype(mx.complex64) + im.astype(mx.complex64) * mx.array(1j)
+    if mx.metal.is_available():
+        # gather kernel: one thread per output sample, no scatter collisions
+        out = _ola_metal.ola_gather(y.reshape((-1, nblocks, nblock)), step, full_len)
     else:
-        out = mx.zeros((v2.shape[0], full_len)).at[:, pos].add(v2)
+        pos = (
+            (step * mx.arange(nblocks, dtype=mx.int32))[:, None]
+            + mx.arange(nblock, dtype=mx.int32)[None, :]
+        ).reshape(-1)
+        v2 = y.reshape((-1, nblocks * nblock))
+        if complex_result:
+            re = mx.zeros((v2.shape[0], full_len)).at[:, pos].add(mx.real(v2))
+            im = mx.zeros((v2.shape[0], full_len)).at[:, pos].add(mx.imag(v2))
+            out = re.astype(mx.complex64) + im.astype(mx.complex64) * mx.array(1j)
+        else:
+            out = mx.zeros((v2.shape[0], full_len)).at[:, pos].add(v2)
     out = out.reshape(tuple(batch) + (full_len,))[..., : n1 + n2 - 1]
 
     out = mx.moveaxis(out, -1, ax)

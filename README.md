@@ -38,10 +38,10 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | spectrogram | 16ch × 2^20 | 68.7 ms | 6.8 ms | 1.3 ms | **10.1x / 53.7x** |
 | stft | 16ch × 2^20, nperseg=1024 | 81.4 ms | 4.7 ms | 1.3 ms | **17.3x / 63.8x** |
 | istft | 16ch × 2^20, nperseg=1024 | 174.4 ms | 22.9 ms | 3.2 ms | **7.6x / 54.6x** |
-| fftconvolve | 2^20 × 4097 | 11.2 ms | 1.8 ms | 1.5 ms | **6.4x / 7.5x** |
-| fftconvolve | 2^22 × 257 | 47.8 ms | 2.9 ms | 1.7 ms | **16.3x / 27.7x** |
-| oaconvolve | 2^23 × 513 | 27.4 ms | 4.0 ms | 2.7 ms | **6.8x / 10.4x** |
-| correlate (batched) | 64ch × 2^18, 4096 taps | 65.2 ms | 8.4 ms | 6.1 ms | **7.8x / 10.7x** |
+| fftconvolve | 2^20 × 4097 | 11.46 ms | 1.50 ms | 1.27 ms | **7.7x / 9.0x** |
+| fftconvolve | 2^22 × 257 | 48.86 ms | 2.63 ms | 0.86 ms | **18.6x / 56.6x** |
+| oaconvolve | 2^23 × 513 | 27.19 ms | 4.34 ms | 2.34 ms | **6.3x / 11.6x** |
+| correlate (batched) | 64ch × 2^18, 4096 taps | 64.49 ms | 6.80 ms | 4.73 ms | **9.5x / 13.6x** |
 | resample_poly | 16ch, 48k→44.1k (147/160) | 120.7 ms | 6.1 ms | 3.9 ms | **19.7x / 31.0x** |
 | upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.6 ms | 7.5 ms | 5.5 ms | **40.4x / 55.2x** |
 | upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 182.7 ms | 3.8 ms | 1.3 ms | **47.6x / 145.4x** |
@@ -126,7 +126,7 @@ python -m pytest -q         # 333 golden tests against scipy and NumPy
 | area | functions | notes |
 |---|---|---|
 | spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernels on the pow2 hot path (two-signal csd/coherence variant, inverse+gather-OLA for istft), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
-| convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; FFT lengths padded to powers of two |
+| convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; pow2-padded FFTs, with long×short convolutions auto-blocked into small FFTs reassembled by a gather-OLA kernel |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, taps tiled through threadgroup memory (or read direct at high `up`), complex-native — an IQ stream is one launch |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and SOS-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up) with scipy-exact edge handling; design host-side |
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
