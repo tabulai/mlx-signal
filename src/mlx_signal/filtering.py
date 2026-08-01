@@ -318,7 +318,12 @@ def sosfilt(sos, x, axis=-1, zi=None):
     def _scipy_path():
         import scipy.signal as sps
 
-        out = sps.sosfilt(sos_np, signal_np(x), axis=axis,
+        # every dispatch route executes the SAME filter: the float32-quantized
+        # coefficients the Metal kernels run. Routing by batch size must never
+        # change which filter the user gets (for narrowband designs the f64
+        # and f32-quantized filters differ at O(1), not at rounding level).
+        sos_run = sos_np if complex_sos else sos_np.astype(np.float32)
+        out = sps.sosfilt(sos_run, signal_np(x), axis=axis,
                           zi=to_numpy(zi) if zi is not None else None)
         if zi is not None:
             return result_to_mlx(out[0]), result_to_mlx(out[1])
@@ -366,7 +371,13 @@ def sosfilt(sos, x, axis=-1, zi=None):
     else:
         zi2 = mx.zeros((x2.shape[0], n_sections, 2))
 
-    if x2.dtype == mx.complex64:
+    complex_state = zi is not None and zi2.dtype == mx.complex64
+    if x2.dtype == mx.complex64 or complex_state:
+        # complex signal and/or complex state: filtering is linear, so the
+        # real and imaginary parts run as two launches (scipy returns complex
+        # output for real x with complex zi; so do we)
+        if x2.dtype != mx.complex64:
+            x2 = x2.astype(mx.complex64)
         if zi is not None and zi2.dtype != mx.complex64:
             zi2 = zi2.astype(mx.complex64)
         yr, zr = _run(mx.real(x2), mx.real(zi2))
@@ -375,8 +386,6 @@ def sosfilt(sos, x, axis=-1, zi=None):
         y2 = yr.astype(mx.complex64) + yi.astype(mx.complex64) * j
         zf2 = zr.astype(mx.complex64) + zim.astype(mx.complex64) * j
     else:
-        if zi is not None and zi2.dtype == mx.complex64:
-            raise ValueError("complex zi requires complex x")
         y2, zf2 = _run(x2, zi2)
 
     y = y2.reshape(batch_shape + (n,))
@@ -407,8 +416,9 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
     if np.iscomplexobj(sos_np) or not use_mlx(input_size(x) * n_sections):
         import scipy.signal as sps
 
+        sos_run = sos_np if np.iscomplexobj(sos_np) else sos_np.astype(np.float32)
         return result_to_mlx(
-            sps.sosfiltfilt(sos_np, signal_np(x), axis=axis, padtype=padtype,
+            sps.sosfiltfilt(sos_run, signal_np(x), axis=axis, padtype=padtype,
                             padlen=padlen)
         )
 
@@ -447,13 +457,11 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
 
     from scipy.signal import sosfilt_zi as _sosfilt_zi
 
-    from . import _sosfilt_metal
 
-    # the GPU kernel runs float32-rounded coefficients; the steady-state zi
-    # must describe THAT filter, or narrowband cascades start visibly wrong
-    sos_zi = sos_np
-    if mx.metal.is_available() and n_sections <= _sosfilt_metal.MAX_SECTIONS:
-        sos_zi = sos_np.astype(np.float32).astype(np.float64)
+    # every route (Metal kernel or scipy fallback) executes the float32-
+    # quantized filter, so the steady-state zi must describe THAT filter —
+    # a float64-designed zi starts narrowband cascades visibly wrong
+    sos_zi = sos_np.astype(np.float32).astype(np.float64)
     zi_np = np.asarray(_sosfilt_zi(sos_zi), dtype=np.float64)  # (S, 2)
     zi_shape = [1] * ext.ndim
     zi_shape[-1] = 2

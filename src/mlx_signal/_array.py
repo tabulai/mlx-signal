@@ -53,8 +53,9 @@ def to_mlx(x) -> mx.array:
         # lists / scalars: let MLX pick its native 32-bit defaults, then normalize
         return to_mlx(mx.array(x))
     if x.ndim == 0:
-        # mx.array(np 0-d) yields shape (1,); go through a Python scalar
-        return to_mlx(mx.array(x.item()))
+        # mx.array(np 0-d) yields shape (1,); convert as 1-D (so the dtype
+        # policy — DowncastWarning / strict — still applies) and reshape back
+        return to_mlx(x.reshape(1)).reshape(())
     if x.dtype == np.float32 or x.dtype == np.complex64:
         return mx.array(np.ascontiguousarray(x))
     if x.dtype.kind == "f":
@@ -117,6 +118,8 @@ def result_to_mlx(a) -> mx.array:
         a = a.astype(np.complex64)
     elif a.dtype.kind in "iub":
         a = a.astype(np.float32)
+    if a.ndim == 0:  # scipy scalar results stay 0-d (mx.array would make (1,))
+        return mx.array(np.ascontiguousarray(a.reshape(1))).reshape(())
     return mx.array(np.ascontiguousarray(a))
 
 

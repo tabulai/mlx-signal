@@ -26,6 +26,8 @@ class ByteBudgetCache:
         return entry[0]
 
     def put(self, key: tuple, value, nbytes: int) -> None:
+        if int(nbytes) > self.budget:
+            return  # oversized entries are returned to the caller uncached
         if key in self._entries:
             self._total -= self._entries.pop(key)[1]
         self._entries[key] = (value, int(nbytes))

@@ -267,7 +267,7 @@ def test_sosfilt_scan_matrix(rng, dtype, sos_key, n):
     without Metal everything runs scipy in float64."""
     sos = _MATRIX_FILTERS[sos_key].astype(dtype)
     x = rng.standard_normal((40, n)).astype(np.float32)
-    ref = sps.sosfilt(sos.astype(np.float32) if HAS_GPU else sos.astype(np.float64), x)
+    ref = sps.sosfilt(sos.astype(np.float32), x)  # all routes run the f32 filter
     with msig.config_context(dispatch="auto"):
         out = np.array(msig.sosfilt(sos, x))
     tol = 1e-5 if HAS_GPU else 1e-4
@@ -300,7 +300,46 @@ def test_sosfiltfilt_narrowband_zi_matches_executed_filter():
     sos = sps.butter(2, 1e-4, output="sos")
     x = np.ones(60_000, np.float32)
     # the f32-rounded coefficients form a genuinely different filter (DC-gain
-    # cancellation): compare against whichever filter this build executes
-    ref = sps.sosfiltfilt(sos.astype(np.float32) if HAS_GPU else sos, x)
+    # cancellation); every dispatch route now executes exactly that filter
+    ref = sps.sosfiltfilt(sos.astype(np.float32), x)
     out = np.array(msig.sosfiltfilt(sos, x))
     assert np.abs(out - ref).max() < 0.02
+
+
+def test_sosfilt_auto_routing_is_filter_invariant(rng):
+    """Default-auto routing (scipy vs kernel, by batch size / scan safety)
+    must never change WHICH filter runs: every route executes the float32-
+    quantized coefficients. Previously a narrowband design differed by 4.9%
+    L2 across the 31/32-channel boundary and sosfiltfilt mixed precisions
+    within one call (0.76 max error from batching alone)."""
+    sos = sps.butter(2, 1e-4, output="sos")
+    xn = rng.standard_normal(20_000).astype(np.float32)
+    with msig.config_context(dispatch="auto", warn_on_downcast=False):
+        r31 = np.array(msig.sosfilt(sos, np.tile(xn, (31, 1))))[0]
+        r32 = np.array(msig.sosfilt(sos, np.tile(xn, (32, 1))))[0]
+    tol = (1e-6 if _SCIPY_VER >= (1, 15) else 1e-2) if HAS_GPU else 0.0
+    np.testing.assert_allclose(r31, r32, atol=tol * max(np.abs(r32).max(), 1e-9))
+
+    x1 = np.ones(60_000, np.float32)
+    with msig.config_context(dispatch="auto", warn_on_downcast=False):
+        o1 = np.array(msig.sosfiltfilt(sos, x1))
+        ob = np.array(msig.sosfiltfilt(sos, np.tile(x1, (32, 1))))[0]
+    np.testing.assert_allclose(o1, ob, atol=tol * max(np.abs(ob).max(), 1e-9))
+    ref = sps.sosfiltfilt(sos.astype(np.float32), x1)
+    assert np.abs(o1 - ref).max() < 0.02  # matches the f32 filter, not neither
+
+
+@pytest.mark.parametrize("n", [16_383, 16_384])  # straddles the auto threshold
+def test_sosfilt_complex_zi_real_x(rng, n):
+    """scipy accepts real x with complex zi (complex output); so must every
+    dispatch route — the Metal path previously raised above the threshold."""
+    sos = sps.butter(4, 0.25, output="sos")
+    zi = (rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2))).astype(np.complex64)
+    x = rng.standard_normal(n).astype(np.float32)
+    ref_y, ref_zf = sps.sosfilt(sos.astype(np.float32), x, zi=zi)
+    with msig.config_context(dispatch="auto", warn_on_downcast=False):
+        y, zf = msig.sosfilt(sos, x, zi=zi)
+    assert np.array(y).dtype == np.complex64
+    np.testing.assert_allclose(np.array(y), ref_y, rtol=1e-4,
+                               atol=1e-5 * np.abs(ref_y).max())
+    np.testing.assert_allclose(np.array(zf), ref_zf, rtol=1e-4, atol=1e-4)

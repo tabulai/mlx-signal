@@ -77,17 +77,25 @@ def timed(fn, warmup=2, repeat=5):
     return statistics.median(times), repeat
 
 
-def rel_err(out, ref):
+def rel_err(out, ref, tol=1e-3):
+    """Format the relative error — and FAIL the run if it exceeds ``tol``.
+
+    A benchmark of wrong results is worthless; a mismatch aborts before any
+    number is reported."""
     out = np.asarray(out)
     ref = np.asarray(ref)
     if out.shape != ref.shape:
-        return f"shape {out.shape}!={ref.shape}"
+        raise RuntimeError(f"verification failed: shape {out.shape} != {ref.shape}")
     e = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
+    if not e <= tol:
+        raise RuntimeError(f"verification failed: rel err {e:.2e} > {tol:.0e}")
     return f"{e:.0e}"
 
 
-def bestlag_corr(out, ref, max_lag=64):
-    """Correlation after searching a small alignment lag (for resamplers)."""
+def bestlag_corr(out, ref, max_lag=64, min_r=0.97):
+    """Correlation after searching a small alignment lag (for resamplers).
+
+    Fails the run when correlation drops below ``min_r``."""
     a = np.asarray(out, dtype=np.float64).ravel()
     b = np.asarray(ref, dtype=np.float64).ravel()
     n = min(len(a), len(b)) - 2 * max_lag
@@ -97,6 +105,8 @@ def bestlag_corr(out, ref, max_lag=64):
         seg = a[max_lag + lag : max_lag + lag + n]
         c = np.corrcoef(seg - seg.mean(), b0)[0, 1]
         best = max(best, abs(c))
+    if not best >= min_r:
+        raise RuntimeError(f"verification failed: best-lag correlation {best:.4f} < {min_r}")
     return f"r={best:.4f}"
 
 

@@ -145,9 +145,8 @@ def test_sosfilt_narrowband_long_signal_accurate(rng):
     sos = sps.butter(2, 1e-5, output="sos")
     x = np.zeros(200_000, dtype=np.float32)
     x[0] = 1.0
-    # on GPU the kernel runs the f32 recurrence; the no-Metal scipy fallback
-    # computes in f64 — reference must match the arithmetic actually used
-    ref = sps.sosfilt(sos.astype(np.float32), x) if HAS_GPU else sps.sosfilt(sos, x)
+    # every dispatch route executes the float32-quantized filter
+    ref = sps.sosfilt(sos.astype(np.float32), x)
     out = np.array(msig.sosfilt(sos, x))
     scale = np.abs(ref).max()
     np.testing.assert_allclose(out, ref, atol=1e-4 * scale)
@@ -345,3 +344,33 @@ def test_nd_fft_length_one_axis(rng):
         np.fft.irfftn(np.fft.rfftn(np.array(x), s=[1], axes=[-1]), s=[1], axes=[-1]),
         atol=1e-6,
     )
+
+
+def test_zero_dim_dtype_policy():
+    """0-d float64 arrays must honor strict/downcast like any other input."""
+    from mlx_signal._array import to_mlx
+
+    with msig.config_context(float64="strict"):
+        with pytest.raises(TypeError, match="strict"):
+            to_mlx(np.array(2.0))
+    with msig.config_context(float64="downcast", warn_on_downcast=True):
+        with pytest.warns(msig.DowncastWarning):
+            assert to_mlx(np.array(2.0)).shape == ()
+
+
+def test_direct_method_scalar_shapes():
+    """method='direct' scalar results stay 0-d like the fft path."""
+    a, b = np.float32(2.0), np.float32(3.0)
+    assert np.array(msig.convolve(a, b, method="direct")).shape == ()
+    assert np.array(msig.correlate(a, b, method="direct")).shape == ()
+
+
+def test_byte_budget_cache_hard_bound():
+    from mlx_signal._cache import ByteBudgetCache
+
+    c = ByteBudgetCache(100)
+    c.put(("big",), "v", 200)
+    assert c.get(("big",)) is None and c._total == 0
+    c.put(("a",), 1, 60)
+    c.put(("b",), 2, 60)
+    assert c._total <= 100
