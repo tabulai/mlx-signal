@@ -558,3 +558,174 @@ def istft_frames(z3: mx.array, win_np, scale: float, nperseg: int, hop: int):
         output_dtypes=[mx.float32, mx.float32],
     )
     return out.reshape(batch_shape + (outlen,)), norm
+
+
+# ---------------------------------------------------------------------------
+# fused block FFT-convolution: forward FFT, spectrum multiply, and inverse FFT
+# of each overlap-add block in one threadgroup pass
+# ---------------------------------------------------------------------------
+
+# NOTE (Metal compiler bug): a loop with mirrored threadgroup reads
+# (buf[k] and buf[M-k]) that WRITES threadgroup memory crashes the shader
+# compiler (XPC_ERROR_CONNECTION_INTERRUPTED); the identical loop writing to
+# device memory compiles. The block convolution is therefore split into two
+# kernels around a device scratch of the repacked spectrum.
+_FFTCONV_FWD_SRC = """
+    uint tid = thread_index_in_threadgroup;
+    uint seg = threadgroup_position_in_grid.y;
+    int n_in    = params[0];
+    int step    = params[1];
+    int nblocks = params[2];
+    int total   = params[3];
+    if ((int)seg >= total) return;
+
+    int row = (int)seg / nblocks;
+    int blk = (int)seg - row * nblocks;
+    long xoff = (long)row * n_in;
+    long start = (long)blk * step;
+    const device float2* twf = (const device float2*)tw;
+    const device float2* utf = (const device float2*)ut;
+
+    threadgroup float2 buf0[{M}];
+    threadgroup float2 buf1[{M}];
+    threadgroup float2* Z;
+
+    // load this block's DISJOINT step-sized chunk (zero-padded to N): the
+    // overlap in overlap-add comes from the convolution tails, not the input
+    for (int i = tid; i < {M}; i += {T}) {{
+        int l0 = 2 * i;
+        long t0 = start + l0;
+        float a = (l0 < step && t0 < n_in) ? x[xoff + t0] : 0.0f;
+        float b = (l0 + 1 < step && t0 + 1 < n_in) ? x[xoff + t0 + 1] : 0.0f;
+        buf0[i] = float2(a, b);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+{FFT}
+
+    // fused untangle + spectrum multiply + inverse repack, written to device:
+    // the block is real, so X[M-k] = conj(X[k]) and one untangle per k
+    // suffices; H carries the 1/M of the inverse transform
+    device float* srow = scratch + (long)seg * (2 * {M});
+    for (int k = tid; k < {M}; k += {T}) {{
+        float2 P1, P2;
+        if (k == 0) {{
+            float x0 = Z[0].x + Z[0].y;   // X[0], real
+            float xm = Z[0].x - Z[0].y;   // X[M], real
+            P1 = float2(x0 * hf[0], x0 * hf[1]);
+            P2 = float2(xm * hf[2 * {M}], xm * hf[2 * {M} + 1]);
+        }} else {{
+            // one pair of Z reads yields both bins:
+            // X[k]   = ze + (-i) * (u * zo)
+            // X[M-k] = conj(ze) + (-i) * conj(u * zo)
+            float2 zk  = Z[k];
+            float2 zmk = Z[{M} - k];
+            float2 ze  = float2(0.5f * (zk.x + zmk.x), 0.5f * (zk.y - zmk.y));
+            float2 zo  = float2(0.5f * (zk.x - zmk.x), 0.5f * (zk.y + zmk.y));
+            float2 wzo = cmul(utf[k], zo);
+            float2 X1 = float2(ze.x + wzo.y, ze.y - wzo.x);
+            float2 X2 = float2(ze.x - wzo.y, -ze.y - wzo.x);
+            P1 = cmul(X1, float2(hf[2 * k], hf[2 * k + 1]));
+            P2 = cmul(X2, float2(hf[2 * ({M} - k)], hf[2 * ({M} - k) + 1]));
+        }}
+        // repack conj(Zc[k]) from the bin pair (P1 = P[k], P2 = P[M-k])
+        float2 E  = float2(0.5f * (P1.x + P2.x), 0.5f * (P1.y - P2.y));
+        float2 wO = float2(0.5f * (P1.x - P2.x), 0.5f * (P1.y + P2.y));
+        float2 u  = utf[k];
+        float2 O  = cmul(float2(u.x, -u.y), wO);
+        srow[2 * k]     = E.x - O.y;
+        srow[2 * k + 1] = -(E.y + O.x);
+    }}
+"""
+
+_FFTCONV_INV_SRC = """
+    uint tid = thread_index_in_threadgroup;
+    uint seg = threadgroup_position_in_grid.y;
+    int total = params[3];
+    if ((int)seg >= total) return;
+
+    const device float2* twf = (const device float2*)tw;
+    threadgroup float2 buf0[{M}];
+    threadgroup float2 buf1[{M}];
+    threadgroup float2* Z;
+
+    const device float* srow = scratch + (long)seg * (2 * {M});
+    for (int i = tid; i < {M}; i += {T}) {{
+        buf0[i] = float2(srow[2 * i], srow[2 * i + 1]);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+{FFT}
+
+    // z[t] = conj(fft(conj(.)))[t]; 1/M was folded into the spectrum
+    device float* orow = out + (long)seg * {N};
+    for (int t = tid; t < {M}; t += {T}) {{
+        float2 a = Z[t];
+        orow[2 * t]     =  a.x;
+        orow[2 * t + 1] = -a.y;
+    }}
+"""
+
+FFTCONV_N = 2048  # block length; filters up to N//2 + 1 taps keep step >= N/2
+_FFTCONV_M = FFTCONV_N // 2
+
+
+@functools.lru_cache(maxsize=4)
+def _fftconv_kernels():
+    N = FFTCONV_N
+    M = N // 2
+    S = int(math.log2(M))
+    T = min(256, max(32, M // 2))
+    fft = _PAIR_FFT.format(M=M, S=S, T=T)
+    fwd = mx.fast.metal_kernel(
+        name=f"mlx_signal_fftconv_fwd_{N}",
+        input_names=["x", "hf", "tw", "ut", "params"],
+        output_names=["scratch"],
+        source=_FFTCONV_FWD_SRC.format(N=N, M=M, T=T, FFT=fft),
+        header=_HEADER.format(M=M),
+    )
+    inv = mx.fast.metal_kernel(
+        name=f"mlx_signal_fftconv_inv_{N}",
+        input_names=["scratch", "tw", "params"],
+        output_names=["out"],
+        source=_FFTCONV_INV_SRC.format(N=N, M=M, T=T, FFT=fft),
+        header=_HEADER.format(M=M),
+    )
+    return fwd, inv, T
+
+
+def fftconv_blocks(x2: mx.array, h: mx.array):
+    """Blocked FFT convolution of real (B, n) rows with real taps h.
+
+    Requires ``h.shape[0] <= FFTCONV_N // 2 + 1``. Returns
+    ``(blocks (B, nblocks, N), step)`` — per-block full convolutions ready for
+    gather overlap-add.
+    """
+    B, n = x2.shape
+    n_taps = h.shape[0]
+    N = FFTCONV_N
+    M = N // 2
+    step = N - n_taps + 1
+    nblocks = -(-n // step)
+    total = B * nblocks
+
+    hf = mx.fft.rfft(h, n=N) * mx.array(1.0 / M, dtype=mx.float32)
+    hf_f = mx.view(hf, mx.float32)
+    fwd, inv, T = _fftconv_kernels()
+    tw, ut = _tables(N)
+    params = mx.array([n, step, nblocks, total], dtype=mx.int32)
+    (scratch,) = fwd(
+        inputs=[x2, hf_f, tw, ut, params],
+        grid=(T, total, 1),
+        threadgroup=(T, 1, 1),
+        output_shapes=[(total, 2 * M)],
+        output_dtypes=[mx.float32],
+    )
+    (out,) = inv(
+        inputs=[scratch, tw, params],
+        grid=(T, total, 1),
+        threadgroup=(T, 1, 1),
+        output_shapes=[(total, N)],
+        output_dtypes=[mx.float32],
+    )
+    return out.reshape(B, nblocks, N), step

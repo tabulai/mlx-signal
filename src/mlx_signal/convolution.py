@@ -15,7 +15,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
-from . import _ola_metal
+from . import _ola_metal, _stft_metal
 from ._array import result_to_mlx, to_mlx, to_numpy
 from ._config import use_mlx
 from ._fft import next_fast_len
@@ -228,6 +228,27 @@ def oaconvolve(in1, in2, mode="full", axes=None):
                            for i in range(a1.ndim)]
         )
         return _apply_conv_mode(ret, s1, s2, mode, axes)
+
+    # fully fused kernel path: real data with one shared filter that fits a
+    # block — forward FFT, spectrum multiply, and inverse all in threadgroup
+    # memory, then gather overlap-add; no padded signal copy, no giant FFTs
+    if (
+        mx.metal.is_available()
+        and b1.dtype == mx.float32
+        and b2.dtype == mx.float32
+        and n2 <= _stft_metal.FFTCONV_N // 2 + 1
+        and n1 + n2 - 1 > _stft_metal.FFTCONV_N
+        and all(d == 1 for i, d in enumerate(b2.shape) if i != ax)
+    ):
+        b1m = mx.moveaxis(b1, ax, -1)
+        blocks, step = _stft_metal.fftconv_blocks(
+            b1m.reshape(-1, n1), b2.reshape(n2)
+        )
+        full_len = (blocks.shape[1] - 1) * step + _stft_metal.FFTCONV_N
+        out = _ola_metal.ola_gather(blocks, step, full_len)[..., : n1 + n2 - 1]
+        out = out.reshape(b1m.shape[:-1] + (n1 + n2 - 1,))
+        out = mx.moveaxis(out, -1, ax)
+        return _apply_conv_mode(out, s1, s2, mode, axes)
 
     b1, b2, complex_result = _promote_pair(b1, b2)
     b1 = mx.moveaxis(b1, ax, -1)
