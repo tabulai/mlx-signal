@@ -9,6 +9,7 @@ cliff the way raw non-power-of-two FFTs do.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import mlx.core as mx
@@ -126,6 +127,7 @@ def fftconvolve(in1, in2, mode="full", axes=None):
     if a1.size == 0 or a2.size == 0:
         return mx.zeros((0,), dtype=a1.dtype)
 
+    same_input = in1 is in2
     axes_arg = axes
     a1, a2, axes = _init_conv_axes(a1, a2, mode, axes, sorted_axes=False)
     s1, s2 = a1.shape, a2.shape
@@ -153,24 +155,43 @@ def fftconvolve(in1, in2, mode="full", axes=None):
         ):
             return oaconvolve(a1, a2, mode=mode, axes=list(axes))
 
-    ret = _freq_domain_conv(a1, a2, axes, shape)
+    ret = _freq_domain_conv(a1, a2, axes, shape, same_input=same_input)
     return _apply_conv_mode(ret, s1, s2, mode, axes)
 
 
-def _freq_domain_conv(a1, a2, axes, shape):
-    """FFT-multiply-IFFT over ``axes`` at padded fast lengths, sliced to ``shape``."""
+def _freq_domain_conv(a1, a2, axes, shape, same_input=False):
+    """FFT-multiply-IFFT over ``axes`` at padded fast lengths, sliced to ``shape``.
+
+    Single-axis transforms go through the 1-D FFT wrappers so broken Metal
+    lengths run as GPU four-step decompositions rather than on the CPU stream
+    (a 2^20-sample pair convolution is ~15x faster for it). ``same_input``
+    (auto-convolution) computes one forward transform and squares it.
+    """
     if not len(axes):
         return a1 * a2
     a1, a2, complex_result = _promote_pair(a1, a2)
     fshape = [next_fast_len(shape[a]) for a in axes]
-    if not complex_result:
-        sp1 = _sfft.rfftn(a1, s=fshape, axes=axes)
-        sp2 = _sfft.rfftn(a2, s=fshape, axes=axes)
-        ret = _sfft.irfftn(sp1 * sp2, s=fshape, axes=axes)
-    else:
+    if len(axes) == 1:
+        ax, fl = axes[0], fshape[0]
+        if complex_result:
+            sp1 = _sfft.fft(a1, n=fl, axis=ax)
+            sp2 = sp1 if same_input else _sfft.fft(a2, n=fl, axis=ax)
+            ret = _sfft.ifft(sp1 * sp2, n=fl, axis=ax)
+        elif same_input:
+            sp1 = _sfft.rfft(a1, n=fl, axis=ax)
+            ret = _sfft.irfft(sp1 * sp1, n=fl, axis=ax)
+        else:
+            sp1 = _sfft.rfft(a1, n=fl, axis=ax)
+            sp2 = _sfft.rfft(a2, n=fl, axis=ax)
+            ret = _sfft.irfft(sp1 * sp2, n=fl, axis=ax)
+    elif complex_result:
         sp1 = _sfft.fftn(a1, s=fshape, axes=axes)
-        sp2 = _sfft.fftn(a2, s=fshape, axes=axes)
+        sp2 = sp1 if same_input else _sfft.fftn(a2, s=fshape, axes=axes)
         ret = _sfft.ifftn(sp1 * sp2, s=fshape, axes=axes)
+    else:
+        sp1 = _sfft.rfftn(a1, s=fshape, axes=axes)
+        sp2 = sp1 if same_input else _sfft.rfftn(a2, s=fshape, axes=axes)
+        ret = _sfft.irfftn(sp1 * sp2, s=fshape, axes=axes)
     fslice = tuple(
         slice(shape[a]) if a in axes else slice(None) for a in range(a1.ndim)
     )
@@ -348,7 +369,68 @@ def correlate(in1, in2, mode="full", method="auto"):
 
         return result_to_mlx(sps.correlate(signal_np(in1), signal_np(in2), mode=mode,
                                            method="direct"))
+    if in1 is in2:
+        return _autocorrelate(a1, in1, mode)
     return fftconvolve(a1, _reverse_and_conj(a2), mode=mode)
+
+
+@functools.lru_cache(maxsize=64)
+def _rev_twiddle(fl: int, length: int, half: bool) -> mx.array:
+    """Linear phase relating a reversed signal's spectrum to conj(X).
+
+    FFT(rev(conj(x)), fl)[k] = exp(-2j*pi*k*(length-1)/fl) * conj(X[k]); the
+    phase is reduced mod fl in exact int64 before the complex exponential.
+    """
+    k = np.arange(fl // 2 + 1 if half else fl, dtype=np.int64)
+    phase = -2.0 * np.pi * ((k * (length - 1)) % fl) / fl
+    return mx.array(np.exp(1j * phase).astype(np.complex64))
+
+
+def _autocorrelate(x: mx.array, orig, mode: str) -> mx.array:
+    """correlate(x, x): one forward FFT instead of two plus a reversed copy.
+
+    The reversed-conjugate input's spectrum is conj(X) times a linear phase
+    (:func:`_rev_twiddle`), so the second transform is never computed.
+    """
+    if x.ndim == 0:
+        return x * mx.conj(x) if x.dtype == mx.complex64 else x * x
+    if x.size == 0:
+        return mx.zeros((0,), dtype=x.dtype)
+    s1 = x.shape
+    axes = [a for a in range(x.ndim) if s1[a] != 1]
+    shape = [s1[a] if a not in axes else 2 * s1[a] - 1 for a in range(x.ndim)]
+    if not use_mlx(int(np.prod(shape))):
+        import scipy.signal as sps
+
+        out = sps.correlate(signal_np(orig), signal_np(orig), mode=mode, method="fft")
+        return result_to_mlx(out)
+    if not axes:
+        ret = x * mx.conj(x) if x.dtype == mx.complex64 else x * x
+        return _apply_conv_mode(ret, s1, s1, mode, axes)
+    complex_input = x.dtype == mx.complex64
+    fshape = [next_fast_len(shape[a]) for a in axes]
+    if len(axes) == 1:
+        ax, fl = axes[0], fshape[0]
+        sp = _sfft.fft(x, n=fl, axis=ax) if complex_input else _sfft.rfft(x, n=fl, axis=ax)
+    else:
+        sp = (_sfft.fftn(x, s=fshape, axes=axes) if complex_input
+              else _sfft.rfftn(x, s=fshape, axes=axes))
+    sp2 = mx.conj(sp)
+    for i, (a, fl) in enumerate(zip(axes, fshape, strict=True)):
+        half = (not complex_input) and i == len(axes) - 1  # rfftn halves axes[-1]
+        tw = _rev_twiddle(fl, s1[a], half)
+        bshape = [1] * sp2.ndim
+        bshape[a] = tw.shape[0]
+        sp2 = sp2 * tw.reshape(bshape)
+    prod = sp * sp2
+    if len(axes) == 1:
+        ax, fl = axes[0], fshape[0]
+        ret = _sfft.ifft(prod, n=fl, axis=ax) if complex_input else _sfft.irfft(prod, n=fl, axis=ax)
+    else:
+        ret = (_sfft.ifftn(prod, s=fshape, axes=axes) if complex_input
+               else _sfft.irfftn(prod, s=fshape, axes=axes))
+    fslice = tuple(slice(shape[a]) if a in axes else slice(None) for a in range(x.ndim))
+    return _apply_conv_mode(ret[fslice], s1, s1, mode, axes)
 
 
 def correlation_lags(in1_len, in2_len, mode="full") -> np.ndarray:

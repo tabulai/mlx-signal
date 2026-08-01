@@ -110,6 +110,23 @@ def build_cases(quick: bool) -> list[Case]:
             (a, b),
         ))
 
+    n = (1 << 20) if not quick else (1 << 18)
+    a, b = sig(n), sig(n)
+    cases.append(Case(
+        "fftconvolve (pair)", f"2^{int(np.log2(n))} x 2^{int(np.log2(n))}",
+        lambda a=a, b=b: sps.fftconvolve(a, b),
+        lambda a=a, b=b: msig.fftconvolve(a, b),
+        (a, b),
+    ))
+
+    x = sig(1 << 20) if not quick else sig(1 << 18)
+    cases.append(Case(
+        "correlate (auto)", f"2^{int(np.log2(x.size))} autocorrelation",
+        lambda x=x: sps.correlate(x, x, method="fft"),
+        lambda x=x: msig.correlate(x, x),
+        (x,),
+    ))
+
     a, b = sig(1 << 23), sig(513)
     if not quick:
         cases.append(Case(
@@ -312,6 +329,10 @@ def _device_variant(case: Case, mx_inputs):
         return lambda: msig.oaconvolve(a[0], a[1])
     if n == "correlate (batched)":
         return lambda: msig.correlate(a[0], a[1], mode="full")
+    if n == "fftconvolve (pair)":
+        return lambda: msig.fftconvolve(a[0], a[1])
+    if n == "correlate (auto)":
+        return lambda: msig.correlate(a[0], a[0])
     if n == "resample_poly":
         return lambda: msig.resample_poly(a[0], 147, 160, axis=-1)
     if n == "upfirdn":

@@ -40,8 +40,10 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | istft | 16ch × 2^20, nperseg=1024 | 174.4 ms | 22.9 ms | 3.2 ms | **7.6x / 54.6x** |
 | fftconvolve | 2^20 × 4097 | 10.96 ms | 1.74 ms | 0.53 ms | **6.3x / 20.8x** |
 | fftconvolve | 2^22 × 257 | 46.44 ms | 3.04 ms | 0.72 ms | **15.3x / 64.1x** |
+| fftconvolve (pair) | 2^20 × 2^20 | 21.14 ms | 2.25 ms | 1.77 ms | **9.4x / 11.9x** |
 | oaconvolve | 2^23 × 513 | 27.04 ms | 2.73 ms | 1.32 ms | **9.9x / 20.5x** |
 | correlate (batched) | 64ch × 2^18, 4096 taps | 65.31 ms | 7.08 ms | 4.63 ms | **9.2x / 14.1x** |
+| correlate (auto) | 2^20 autocorrelation | 21.46 ms | 3.48 ms | 1.34 ms | **6.2x / 16.1x** |
 | resample_poly | 16ch, 48k→44.1k (147/160) | 120.7 ms | 6.1 ms | 3.9 ms | **19.7x / 31.0x** |
 | upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.6 ms | 7.5 ms | 5.5 ms | **40.4x / 55.2x** |
 | upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 182.7 ms | 3.8 ms | 1.3 ms | **47.6x / 145.4x** |
@@ -126,7 +128,7 @@ python -m pytest -q         # 333 golden tests against scipy and NumPy
 | area | functions | notes |
 |---|---|---|
 | spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernels on the pow2 hot path (two-signal csd/coherence variant, inverse+gather-OLA for istft), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
-| convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; pow2-padded FFTs; long×short convolutions auto-block, and filters ≤1025 taps run a fused kernel pair (block FFT, spectrum multiply, inverse FFT in threadgroup memory) reassembled by gather-OLA |
+| convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; pow2-padded FFTs; long×short convolutions auto-block, and filters ≤1025 taps run a fused kernel pair (block FFT, spectrum multiply, inverse FFT in threadgroup memory) reassembled by gather-OLA; `fftconvolve(x, x)` and `correlate(x, x)` skip the second forward transform |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, taps tiled through threadgroup memory (or read direct at high `up`), complex-native — an IQ stream is one launch |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and SOS-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up) with scipy-exact edge handling; design host-side |
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
@@ -183,9 +185,11 @@ rather than hidden.
   and, worse, other lengths above 2^20 *silently return wrong values*
   (rel. error ~1.0). mlx-signal verified the safe region empirically and works
   around it on the GPU: 1-D transforms use an in-library four-step (Bailey)
-  decomposition into safe-size sub-FFTs (`_fourstep.py`), and `fftconvolve`
-  switches to blocked overlap-add. Only unsplittable lengths (large primes) and
-  the N-d FFT paths route through the MLX CPU stream (`_fft_core.py`). When MLX
+  decomposition into safe-size sub-FFTs (`_fourstep.py`), and long×short
+  `fftconvolve` switches to blocked overlap-add (equal-size pairs run their
+  padded FFTs through the four-step path directly). Only unsplittable lengths
+  (large primes) and the N-d FFT paths route through the MLX CPU stream
+  (`_fft_core.py`). When MLX
   fixes this, relaxing one predicate retires the workaround. (Worth reporting
   upstream to `ml-explore/mlx` if you can reproduce it.)
 - Windows/filter design (`get_window`, `firwin*`) and `find_peaks` refinement run

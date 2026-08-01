@@ -155,3 +155,63 @@ def test_convolve_direct_routes_to_scipy(rng):
     out = msig.convolve(a, b, method="direct")
     assert_type_and_dtype(out)
     assert_close(out, sps.convolve(a, b, method="direct"))
+
+
+def test_fftconvolve_equal_pair_fourstep(rng):
+    """Equal-size pair whose padded FFT lands on a broken Metal length: the
+    1-D wrappers must route it through the GPU four-step path (it used to run
+    on the CPU stream via rfftn)."""
+    n = (1 << 19) + 21  # fl = 2^21, in the broken range
+    a = rng.standard_normal(n).astype(np.float32)
+    b = rng.standard_normal(n).astype(np.float32)
+    assert_close(msig.fftconvolve(a, b), sps.fftconvolve(a, b), rtol=2e-4, atol_frac=2e-5)
+
+
+@pytest.mark.parametrize("complex_input", [False, True])
+def test_fftconvolve_same_object(rng, complex_input):
+    """fftconvolve(x, x) computes one forward transform and squares it."""
+    if complex_input:
+        x = (rng.standard_normal(30000) + 1j * rng.standard_normal(30000)).astype(np.complex64)
+    else:
+        x = rng.standard_normal(30000).astype(np.float32)
+    assert_close(msig.fftconvolve(x, x), sps.fftconvolve(x, x), rtol=2e-4, atol_frac=2e-5)
+
+
+def test_convolve_same_object(rng):
+    x = rng.standard_normal(20000).astype(np.float32)
+    assert_close(msig.convolve(x, x), sps.convolve(x, x, method="fft"), rtol=2e-4,
+                 atol_frac=2e-5)
+
+
+@pytest.mark.parametrize("mode", ["full", "same", "valid"])
+@pytest.mark.parametrize("complex_input", [False, True])
+def test_correlate_same_object(rng, mode, complex_input):
+    """correlate(x, x) uses the conjugate-spectrum shortcut (one forward FFT)."""
+    if complex_input:
+        x = (rng.standard_normal(30000) + 1j * rng.standard_normal(30000)).astype(np.complex64)
+    else:
+        x = rng.standard_normal(30000).astype(np.float32)
+    ref = sps.correlate(x, x, mode=mode, method="fft")
+    out = msig.correlate(x, x, mode=mode)
+    assert ref.shape == tuple(np.array(out).shape)
+    assert_close(out, ref, rtol=2e-4, atol_frac=2e-5)
+
+
+def test_correlate_same_object_2d(rng):
+    x = rng.standard_normal((6, 4000)).astype(np.float32)
+    assert_close(msig.correlate(x, x), sps.correlate(x, x, method="fft"), rtol=2e-4,
+                 atol_frac=2e-5)
+
+
+def test_correlate_same_object_singleton_axis(rng):
+    x = rng.standard_normal((1, 2000)).astype(np.float32)
+    assert_close(msig.correlate(x, x), sps.correlate(x, x, method="fft"), rtol=2e-4,
+                 atol_frac=2e-5)
+
+
+def test_correlate_same_object_autocorr_peak(rng):
+    """Physics check: autocorrelation peaks at zero lag with energy value."""
+    x = rng.standard_normal(8192).astype(np.float32)
+    r = np.array(msig.correlate(x, x, mode="full"))
+    assert int(np.argmax(r)) == x.size - 1
+    np.testing.assert_allclose(r[x.size - 1], float(np.dot(x, x)), rtol=1e-5)
