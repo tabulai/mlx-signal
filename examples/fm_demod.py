@@ -1,4 +1,4 @@
-"""FM demodulation on the Apple Silicon GPU — the classic cuSignal demo, reborn.
+"""FM demodulation on the Apple Silicon GPU.
 
 Synthesizes 5 seconds of an FM-modulated IQ stream at 2.4 MS/s (a 1 kHz tone
 plus a slow chirp as the message), then runs the standard receive chain twice —

@@ -206,10 +206,10 @@ rather than hidden.
 
 ## Examples
 
-- [`examples/fm_demod.py`](examples/fm_demod.py) — the classic cuSignal FM
-  demodulation chain (channel filter → polyphase decimate → discriminator →
-  de-emphasis → audio resample), 16.5x end-to-end vs scipy on an M4 Max, with
-  0.999 correlation to the true message.
+- [`examples/fm_demod.py`](examples/fm_demod.py) — an SDR FM demodulation
+  chain (channel filter → polyphase decimate → discriminator → de-emphasis →
+  audio resample), 16.5x end-to-end vs scipy on an M4 Max, with 0.999
+  correlation to the true message.
 - [`examples/eeg_bandpower.py`](examples/eeg_bandpower.py) — 64-channel × 10-minute
   EEG alpha-band power via one batched `welch`, 6x vs scipy including result
   readback.
