@@ -16,7 +16,15 @@ import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
-from ._array import input_size, result_to_mlx, signal_np, to_mlx, to_numpy
+from ._array import (
+    _downcast_notice,
+    check_strict,
+    input_size,
+    result_to_mlx,
+    signal_np,
+    to_mlx,
+    to_numpy,
+)
 from ._arraytools import const_ext, even_ext, odd_ext
 from ._config import capability_fallback, get_config, use_mlx
 from ._sosfilt_metal import SCAN_BLOCK as _SCAN_BLOCK_REF
@@ -232,19 +240,79 @@ _SCAN_MIN_N = 2 * _SCAN_BLOCK_REF
 _SOSFILT_MIN_ROWS = 32
 
 
-def _validate_sos_np(sos) -> np.ndarray:
-    sos = np.atleast_2d(np.asarray(to_numpy(sos)))
-    # canonical coefficient dtype: everything downstream (the scan-safety
-    # cache key, A^L precompute, scipy fallbacks) assumes 8-byte scalars
-    sos = sos.astype(np.complex128 if np.iscomplexobj(sos) else np.float64)
-    if sos.ndim != 2:
+@_functools.lru_cache(maxsize=1)
+def _scipy_sosfilt_f32_order_matches_metal() -> bool:
+    """Whether scipy's f32 recurrence uses the operation order in our kernel."""
+    import scipy
+
+    version = tuple(int(part) for part in scipy.__version__.split(".")[:2])
+    return version >= (1, 15)
+
+
+def _validate_sos_np(sos, *, apply_dtype_policy: bool = True) -> np.ndarray:
+    # scipy's design routines intentionally return float64 SOS. Treat those
+    # small coefficient arrays as design metadata under the default downcast
+    # policy (silently canonicalize them), but honor an explicitly strict
+    # policy. Signal/state arrays still use the normal DowncastWarning path.
+    if apply_dtype_policy:
+        check_strict(sos)
+    sos_raw = np.atleast_2d(np.asarray(to_numpy(sos)))
+    explicit_array = isinstance(sos, (np.ndarray, mx.array))
+    if apply_dtype_policy and explicit_array and (
+        (sos_raw.dtype.kind == "c" and sos_raw.dtype.itemsize > 8)
+        or (sos_raw.dtype.kind == "f" and sos_raw.dtype.itemsize > 8)
+    ):
+        # Real float64 is the routine output dtype of scipy's SOS designers and
+        # stays quiet. Explicit complex128/float128 coefficients are unusual,
+        # materially lossy conversions and should follow the warning policy.
+        _downcast_notice(str(sos_raw.dtype))
+    if sos_raw.ndim != 2:
         raise ValueError("sos array must be 2D")
-    if sos.shape[1] != 6:
+    if sos_raw.shape[1] != 6:
         raise ValueError("sos array must be shape (n_sections, 6)")
-    if sos.shape[0] < 1:
+    if sos_raw.shape[0] < 1:
         raise ValueError("sos array must have at least one section")
-    if not np.all(sos[:, 3] == 1):
+    if not np.all(sos_raw[:, 3] == 1):
         raise ValueError("sos[:, 3] should be all ones")
+
+    # One execution dtype on every route. Complex SOS currently has no Metal
+    # kernel, but its scipy fallback must still obey the documented c64 policy
+    # rather than silently computing in complex128.
+    dtype = np.complex64 if np.iscomplexobj(sos_raw) else np.float32
+    with np.errstate(over="ignore", invalid="ignore"):
+        sos = np.ascontiguousarray(sos_raw, dtype=dtype)
+    if not np.all(np.isfinite(sos)):
+        raise ValueError("sos coefficients must be finite after 32-bit quantization")
+
+    vanished = np.all(sos[:, :3] == 0, axis=1) & np.any(sos_raw[:, :3] != 0, axis=1)
+    if np.any(vanished):
+        section = int(np.flatnonzero(vanished)[0])
+        raise ValueError(
+            f"sos section {section} numerator vanished after {np.dtype(dtype).name} "
+            "quantization; use a better-conditioned section scaling"
+        )
+
+    # A stable host-side design can cross the unit circle when its denominator
+    # is rounded to f32/c64. Running that changed filter produces explosive,
+    # route-sensitive nonsense (and a pole at exactly one makes sosfilt_zi
+    # singular), so fail before either backend executes it. Deliberately
+    # unstable/integrating SOS remain valid for causal sosfilt; reject only a
+    # stability loss introduced by quantization. Apply the same check to
+    # complex-typed copies so dtype alone cannot bypass validation.
+    dtype_name = np.dtype(dtype).name
+    for section, (raw, quantized) in enumerate(zip(sos_raw, sos, strict=True)):
+        raw_poles = np.roots(np.asarray([1.0, raw[4], raw[5]], dtype=np.complex128))
+        poles = np.roots(
+            np.asarray([1.0, quantized[4], quantized[5]], dtype=np.complex128)
+        )
+        raw_radius = float(np.max(np.abs(raw_poles)))
+        radius = float(np.max(np.abs(poles)))
+        if raw_radius < 1.0 and (not np.isfinite(radius) or radius >= 1.0):
+            raise ValueError(
+                f"sos section {section} is unstable after {dtype_name} quantization "
+                f"(maximum pole magnitude {radius:.9g} >= 1); use a "
+                "better-conditioned design or a higher cutoff"
+            )
     return sos
 
 
@@ -318,13 +386,45 @@ def sosfilt(sos, x, axis=-1, zi=None):
     def _scipy_path():
         import scipy.signal as sps
 
-        # every dispatch route executes the SAME filter: the float32-quantized
-        # coefficients the Metal kernels run. Routing by batch size must never
-        # change which filter the user gets (for narrowband designs the f64
-        # and f32-quantized filters differ at O(1), not at rounding level).
-        sos_run = sos_np if complex_sos else sos_np.astype(np.float32)
-        out = sps.sosfilt(sos_run, signal_np(x), axis=axis,
-                          zi=to_numpy(zi) if zi is not None else None)
+        # Use the already-canonicalized signal/state as well as coefficients.
+        # Passing the original f64/c128 objects here made routing by size or
+        # batch count change the recurrence precision and broke streaming when
+        # the returned f32 state was fed into the next chunk.
+        x_np = to_numpy(xa)
+        zi_np = to_numpy(zi_a) if zi is not None else None
+        split_complex = not complex_sos and (
+            np.iscomplexobj(x_np) or (zi_np is not None and np.iscomplexobj(zi_np))
+        )
+        if split_complex:
+            # The Metal implementation runs real and imaginary float32 planes
+            # independently. scipy's native complex64 recurrence rounds in a
+            # different order, which made the 31/32-row routing boundary
+            # visible for narrow filters. Mirror the two-plane arithmetic.
+            xr = np.asarray(np.real(x_np), dtype=np.float32)
+            xi = (
+                np.asarray(np.imag(x_np), dtype=np.float32)
+                if np.iscomplexobj(x_np)
+                else np.zeros_like(xr)
+            )
+            if zi_np is None:
+                yr = sps.sosfilt(sos_np, xr, axis=axis)
+                yi = sps.sosfilt(sos_np, xi, axis=axis)
+                out = np.asarray(yr, dtype=np.complex64) + np.complex64(1j) * yi
+            else:
+                zir = np.asarray(np.real(zi_np), dtype=np.float32)
+                zii = (
+                    np.asarray(np.imag(zi_np), dtype=np.float32)
+                    if np.iscomplexobj(zi_np)
+                    else np.zeros_like(zir)
+                )
+                yr, zfr = sps.sosfilt(sos_np, xr, axis=axis, zi=zir)
+                yi, zfi = sps.sosfilt(sos_np, xi, axis=axis, zi=zii)
+                out = (
+                    np.asarray(yr, dtype=np.complex64) + np.complex64(1j) * yi,
+                    np.asarray(zfr, dtype=np.complex64) + np.complex64(1j) * zfi,
+                )
+        else:
+            out = sps.sosfilt(sos_np, x_np, axis=axis, zi=zi_np)
         if zi is not None:
             return result_to_mlx(out[0]), result_to_mlx(out[1])
         return result_to_mlx(out)
@@ -338,7 +438,22 @@ def sosfilt(sos, x, axis=-1, zi=None):
                   else "no Metal GPU")
         capability_fallback("sosfilt", reason)
         return _scipy_path()
-    use_scan = n >= _SCAN_MIN_N and _scan_safe(sos_np.tobytes(), n_sections)
+    # The safety-cache and transition-power helpers use a canonical f64 byte
+    # key, but the represented coefficients have already been rounded to f32.
+    sos64 = np.ascontiguousarray(sos_np, dtype=np.float64)
+    scan_safe = _scan_safe(sos64.tobytes(), n_sections)
+    use_scan = n >= _SCAN_MIN_N and scan_safe
+    if (
+        get_config().dispatch == "auto"
+        and not scan_safe
+        and not _scipy_sosfilt_f32_order_matches_metal()
+    ):
+        # scipy <1.15 rounds the f32 recurrence in a different order. For a
+        # narrow/long-lived filter, switching from that fallback at 31 rows to
+        # the sequential Metal kernel at 32 was visible at the percent level.
+        # Keep scan-unsafe auto calls on the floor backend; explicit MLX still
+        # pins the kernel, and wide scan-safe filters retain GPU acceleration.
+        return _scipy_path()
     if (
         get_config().dispatch == "auto"
         and not use_scan
@@ -410,18 +525,24 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
     """
     sos_np = _validate_sos_np(sos)
     n_sections = sos_np.shape[0]
+    xa = to_mlx(x)
 
     if np.iscomplexobj(sos_np):
-        capability_fallback("sosfiltfilt", "complex sos coefficients")
-    if np.iscomplexobj(sos_np) or not use_mlx(input_size(x) * n_sections):
+        # Complex coefficients have no Metal kernel. A deliberately selected
+        # scipy route (or an auto-sized tiny call) is not a capability fallback
+        # and should stay silent; auto-large warns and pinned MLX raises.
+        if use_mlx(xa.size * n_sections):
+            capability_fallback("sosfiltfilt", "complex sos coefficients")
         import scipy.signal as sps
 
-        sos_run = sos_np if np.iscomplexobj(sos_np) else sos_np.astype(np.float32)
         return result_to_mlx(
-            sps.sosfiltfilt(sos_run, signal_np(x), axis=axis, padtype=padtype,
+            sps.sosfiltfilt(sos_np, to_numpy(xa), axis=axis, padtype=padtype,
                             padlen=padlen)
         )
 
+    # Real SOS always use this shared wrapper, including dispatch="scipy".
+    # The two inner sosfilt calls still honor dispatch, while padding and the
+    # exact f32 zi stay identical across scipy, auto, and Metal routes.
     if padtype not in ("even", "odd", "constant", None):
         raise ValueError(
             f"Unknown value '{padtype}' given to padtype. padtype must be 'even', "
@@ -437,7 +558,6 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
     else:
         edge = int(padlen)
 
-    xa = to_mlx(x)
     ax = axis % xa.ndim
     if xa.shape[ax] <= edge:
         raise ValueError(
@@ -458,14 +578,14 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
     from scipy.signal import sosfilt_zi as _sosfilt_zi
 
 
-    # every route (Metal kernel or scipy fallback) executes the float32-
-    # quantized filter, so the steady-state zi must describe THAT filter —
-    # a float64-designed zi starts narrowband cascades visibly wrong
-    sos_zi = sos_np.astype(np.float32).astype(np.float64)
-    zi_np = np.asarray(_sosfilt_zi(sos_zi), dtype=np.float64)  # (S, 2)
+    # Use scipy's f32 construction directly. Promoting rounded coefficients
+    # back to f64 before solving changes zi by an ulp; near-unit poles amplify
+    # that into route-dependent transients. Both the direct scipy recurrence
+    # and Metal kernels consume these exact f32 state values.
+    zi_np = np.asarray(_sosfilt_zi(sos_np), dtype=np.float32)  # (S, 2)
     zi_shape = [1] * ext.ndim
     zi_shape[-1] = 2
-    zi = mx.array(zi_np.astype(np.float32)).reshape([n_sections] + zi_shape)
+    zi = mx.array(zi_np).reshape([n_sections] + zi_shape)
 
     x_0 = ext[..., :1]
     y, _ = sosfilt(sos_np, ext, axis=-1, zi=zi * x_0)

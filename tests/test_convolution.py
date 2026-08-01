@@ -157,6 +157,44 @@ def test_convolve_direct_routes_to_scipy(rng):
     assert_close(out, sps.convolve(a, b, method="direct"))
 
 
+@pytest.mark.parametrize(
+    "func", [msig.convolve, msig.correlate], ids=["convolve", "correlate"]
+)
+@pytest.mark.parametrize("method", ["auto", "fft"])
+def test_convolution_wrappers_valid_require_full_coverage(func, method):
+    """Unlike fftconvolve, the high-level wrappers check singleton axes too."""
+    a = np.ones((1, 4), dtype=np.float32)
+    b = np.ones((7, 2), dtype=np.float32)
+    with pytest.raises(ValueError, match="at least as large"):
+        func(a, b, mode="valid", method=method)
+
+
+@pytest.mark.parametrize(
+    "func,ref_func",
+    [(msig.convolve, sps.convolve), (msig.correlate, sps.correlate)],
+    ids=["convolve", "correlate"],
+)
+@pytest.mark.parametrize("method", ["auto", "fft"])
+@pytest.mark.parametrize("swap", [False, True], ids=["larger-first", "larger-second"])
+def test_convolution_wrappers_valid_covered_inputs(func, ref_func, method, swap, rng):
+    large = rng.standard_normal((7, 5)).astype(np.float32)
+    small = rng.standard_normal((2, 3)).astype(np.float32)
+    a, b = (small, large) if swap else (large, small)
+    out = func(a, b, mode="valid", method=method)
+    ref = ref_func(a, b, mode="valid", method=method)
+    assert np.array(out).shape == ref.shape
+    assert_close(out, ref)
+
+
+@pytest.mark.parametrize("func", [msig.fftconvolve, msig.oaconvolve])
+def test_fft_convolution_valid_keeps_singleton_axis_semantics(func):
+    """The FFT-specific APIs permit mixed coverage when singleton axes broadcast."""
+    a = np.ones((1, 4), dtype=np.float32)
+    b = np.ones((7, 2), dtype=np.float32)
+    ref_func = sps.fftconvolve if func is msig.fftconvolve else sps.oaconvolve
+    assert_close(func(a, b, mode="valid"), ref_func(a, b, mode="valid"))
+
+
 def test_fftconvolve_equal_pair_fourstep(rng):
     """Equal-size pair whose padded FFT lands on a broken Metal length: the
     1-D wrappers must route it through the GPU four-step path (it used to run

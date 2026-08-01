@@ -12,10 +12,11 @@ Fairness rules:
 - Identical math where conventions allow: STFT uses periodic hann, n_fft=1024,
   hop=512, center=False everywhere; scipy-family scaling (1/win.sum()) is
   aligned before verification. Every implementation's output is checked against
-  the scipy reference before it is timed (column "vs scipy").
+  the scipy reference before results are published (column "vs scipy").
 - resample is task-level: 48 kHz -> 44.1 kHz at each library's default quality
   (anti-aliasing filter lengths differ; noted, and outputs are checked by
-  best-lag correlation instead of elementwise error).
+  aligned multi-channel correlation, gain, bias, and RMS error instead of
+  elementwise error).
 - e2e timings start and end in NumPy (includes device transfer); device
   timings (GPU rows only) start and end with device-resident arrays.
 - GPU work is synchronized inside the timed region (mx.eval /
@@ -40,6 +41,11 @@ import numpy as np
 import scipy.signal as sps
 
 import mlx_signal as msig
+
+try:
+    from ._validation import rel_err, resample_quality
+except ImportError:  # direct execution: python bench/bench_cross.py
+    from _validation import rel_err, resample_quality
 
 warnings.filterwarnings("ignore")
 
@@ -75,39 +81,6 @@ def timed(fn, warmup=2, repeat=5):
         fn()
         times.append(time.perf_counter() - t0)
     return statistics.median(times), repeat
-
-
-def rel_err(out, ref, tol=1e-3):
-    """Format the relative error — and FAIL the run if it exceeds ``tol``.
-
-    A benchmark of wrong results is worthless; a mismatch aborts before any
-    number is reported."""
-    out = np.asarray(out)
-    ref = np.asarray(ref)
-    if out.shape != ref.shape:
-        raise RuntimeError(f"verification failed: shape {out.shape} != {ref.shape}")
-    e = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
-    if not e <= tol:
-        raise RuntimeError(f"verification failed: rel err {e:.2e} > {tol:.0e}")
-    return f"{e:.0e}"
-
-
-def bestlag_corr(out, ref, max_lag=64, min_r=0.97):
-    """Correlation after searching a small alignment lag (for resamplers).
-
-    Fails the run when correlation drops below ``min_r``."""
-    a = np.asarray(out, dtype=np.float64).ravel()
-    b = np.asarray(ref, dtype=np.float64).ravel()
-    n = min(len(a), len(b)) - 2 * max_lag
-    b0 = b[:n] - b[:n].mean()
-    best = 0.0
-    for lag in range(-max_lag, max_lag + 1):
-        seg = a[max_lag + lag : max_lag + lag + n]
-        c = np.corrcoef(seg - seg.mean(), b0)[0, 1]
-        best = max(best, abs(c))
-    if not best >= min_r:
-        raise RuntimeError(f"verification failed: best-lag correlation {best:.4f} < {min_r}")
-    return f"r={best:.4f}"
 
 
 class Row:
@@ -282,7 +255,7 @@ def task_resample(rng):
                 return taf.resample(t, 160, 147).cpu().numpy()
 
             e2e, n1 = timed(f)
-            chk = bestlag_corr(f()[0], ref[0])
+            chk = resample_quality(f(), ref)
             devt = None
             if devname == "mps":
                 xt = _mps(x)
@@ -304,7 +277,7 @@ def task_resample(rng):
 
         e2e, n1 = timed(f)
         rows.append(Row("librosa.resample (soxr_hq)", "CPU (C)", e2e, n1,
-                        check=bestlag_corr(f()[0], ref[0])))
+                        check=resample_quality(f(), ref)))
 
     if HAVE["soxr"]:
         soxr = HAVE["soxr"]
@@ -313,7 +286,7 @@ def task_resample(rng):
             return soxr.resample(x.T, 48000, 44100, quality="HQ").T
 
         e2e, n1 = timed(f)
-        rows.append(Row("soxr (HQ)", "CPU (C)", e2e, n1, check=bestlag_corr(f()[0], ref[0])))
+        rows.append(Row("soxr (HQ)", "CPU (C)", e2e, n1, check=resample_quality(f(), ref)))
     return ("resample 48 kHz -> 44.1 kHz — 16ch x 2^20 (task-level: each library's "
             "default anti-aliasing filter; scipy/mlx use 3201 taps, torchaudio width=6)"), rows
 
@@ -400,7 +373,7 @@ def to_markdown(sections):
     hdr.append("")
     hdr.append("e2e = NumPy in / NumPy out; device = data resident on the accelerator. "
                "'vs scipy' verifies each output against the scipy reference "
-               "(max relative error, or best-lag correlation for resamplers). "
+               "(max relative error, or aligned multi-channel quality for resamplers). "
                "Rows marked (1 run) exceeded the 3 s guard.")
     lines = hdr
     for title, rows in sections:

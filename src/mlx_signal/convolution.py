@@ -64,6 +64,22 @@ def _inputs_swap_needed(mode, shape1, shape2, axes=None) -> bool:
     return not ok1
 
 
+def _validate_full_valid_shapes(in1, in2, mode) -> None:
+    """Apply convolve/correlate's valid-mode coverage rule over every axis.
+
+    scipy's high-level wrappers require one input to cover the other in every
+    dimension, while fftconvolve intentionally ignores length-1 transform axes
+    before making the same check.  Keep that distinction without materializing
+    MLX inputs merely to inspect their shapes.
+    """
+    if mode != "valid":
+        return
+    shape1 = tuple(in1.shape) if hasattr(in1, "shape") else np.shape(in1)
+    shape2 = tuple(in2.shape) if hasattr(in2, "shape") else np.shape(in2)
+    if len(shape1) == len(shape2):
+        _inputs_swap_needed(mode, shape1, shape2)
+
+
 def _init_conv_axes(a1, a2, mode, axes, sorted_axes=False):
     s1, s2 = a1.shape, a2.shape
     noaxes = axes is None
@@ -351,6 +367,7 @@ def convolve(in1, in2, mode="full", method="auto"):
 
         return result_to_mlx(sps.convolve(signal_np(in1), signal_np(in2), mode=mode,
                                           method="direct"))
+    _validate_full_valid_shapes(in1, in2, mode)
     return fftconvolve(in1, in2, mode=mode)
 
 
@@ -377,6 +394,7 @@ def correlate(in1, in2, mode="full", method="auto"):
 
         return result_to_mlx(sps.correlate(signal_np(in1), signal_np(in2), mode=mode,
                                            method="direct"))
+    _validate_full_valid_shapes(a1, a2, mode)
     if in1 is in2:
         return _autocorrelate(a1, in1, mode)
     return fftconvolve(a1, _reverse_and_conj(a2), mode=mode)

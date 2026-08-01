@@ -355,11 +355,16 @@ def decimate(x, q, n=None, ftype="iir", axis=-1, zero_phase=True):
     if ftype == "iir":
         from scipy.signal import cheby1
 
-        from .filtering import sosfilt, sosfiltfilt
+        from .filtering import _validate_sos_np, sosfilt, sosfiltfilt
 
         if n is None:
             n = 8
-        sos = cheby1(int(n), 0.05, 0.8 / q, output="sos")
+        # This design is internal, not a user-supplied f64 coefficient array:
+        # canonicalize and validate it without tripping float64="strict". The
+        # public sosfilt call below sees the resulting f32 SOS.
+        sos = _validate_sos_np(
+            cheby1(int(n), 0.05, 0.8 / q, output="sos"), apply_dtype_policy=False
+        )
         if zero_phase:
             y = sosfiltfilt(sos, x, axis=axis)
         else:
