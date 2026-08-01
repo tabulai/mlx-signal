@@ -78,18 +78,18 @@ with `pip install -e ".[bench]" && python bench/bench_cross.py`). End-to-end
 
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| welch, 64ch × 2^20 | 501 ms | **18 ms** | — | — | 137 ms | — | — |
-| stft, 16ch × 2^20 | 46 ms | 7.2 ms | 26 ms | **4.2 ms** | 43 ms | 65 ms | — |
-| fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 39 ms | 4.6 ms | 16 ms | — | — |
-| resample 48k→44.1k, 16ch × 2^20 | 122 ms | **6.6 ms**¹ | 8.7 ms¹ | 5.8 ms¹ | — | 56 ms | 53 ms |
-| causal FIR, 64ch × 2^20, 257 taps | 1633 ms | **17 ms** | 2885 ms² | 70 ms² | — | — | — |
+| welch, 64ch × 2^20 | 485 ms | **9.4 ms** | — | — | 137 ms | — | — |
+| stft, 16ch × 2^20 | 45 ms | **4.2 ms** | 25 ms | 4.4 ms | 44 ms | 64 ms | — |
+| fftconvolve, 2^20 × 4097 | 11 ms | **1.7 ms** | 38 ms | 4.5 ms | 16 ms | — | — |
+| resample 48k→44.1k, 16ch × 2^20 | 123 ms | **6.0 ms**¹ | 8.8 ms¹ | 5.9 ms¹ | — | 57 ms | 54 ms |
+| causal FIR, 64ch × 2^20, 257 taps | 1662 ms | **13 ms** | 2837 ms² | 72 ms² | — | — | — |
 
 ¹ Task-level: torchaudio's default anti-aliasing filter (`lowpass_filter_width=6`)
 is far shorter than scipy's/ours (3201 taps here) — mlx-signal matches
 torchaudio-MPS speed while doing ~20x the filter work at scipy-identical quality.
 ² torch has no FFT convolution for filtering, so the idiomatic path is direct
 `conv1d` (O(n·k)); torchaudio's `lfilter` (its general IIR machinery) takes
-**3.6 s on CPU and 21.5 s on MPS** for this FIR case — 1200x slower than
+**3.4 s on CPU and 21.9 s on MPS** for this FIR case — 1700x slower than
 mlx-signal — which is exactly the patchy-MPS-coverage problem this library exists
 to avoid.
 
@@ -97,10 +97,11 @@ Takeaways: nothing else offers GPU `welch`/`csd`/`coherence` (JAX mirrors scipy
 on CPU only; torchaudio has no PSD estimation) — and here `csd`/`coherence` get
 their own two-signal variant of the fused kernel that computes both spectra and
 the cross spectrum in a single sweep (coherence: one pass instead of scipy's
-five). `upfirdn`/`find_peaks` are scipy-only elsewhere. The one column that competes — `torch.stft` on MPS — still
-edges mlx-signal end-to-end (its NumPy↔GPU transfer is cheaper) but loses badly
-on-device, where the transform itself runs 3.5x faster here (0.96 ms vs 3.4 ms);
-and it ships inside a 2 GB torch dependency with the `lfilter` cliff above. The
+five). `upfirdn`/`find_peaks` are scipy-only elsewhere. The closest competitor —
+`torch.stft` on MPS — now trails mlx-signal end-to-end too (4.4 ms vs 4.2 ms)
+and loses badly on-device, where the transform itself runs ~4x faster here
+(0.91 ms vs 3.6 ms); and it ships inside a 2 GB torch dependency with the
+`lfilter` cliff above. The
 speed comes from a fused Metal kernel (`_stft_metal.py`): one threadgroup per
 segment runs strided load → mean-detrend → window → a full radix-2 Stockham FFT
 in threadgroup memory — welch's entire per-segment pipeline reads the signal
