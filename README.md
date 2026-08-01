@@ -40,10 +40,10 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | istft | 16ch × 2^20, nperseg=1024 | 174.4 ms | 22.9 ms | 3.2 ms | **7.6x / 54.6x** |
 | fftconvolve | 2^20 × 4097 | 10.96 ms | 1.74 ms | 0.53 ms | **6.3x / 20.8x** |
 | fftconvolve | 2^22 × 257 | 46.44 ms | 3.04 ms | 0.72 ms | **15.3x / 64.1x** |
-| fftconvolve (pair) | 2^20 × 2^20 | 21.14 ms | 2.25 ms | 1.77 ms | **9.4x / 11.9x** |
+| fftconvolve (pair) | 2^20 × 2^20 | 21.57 ms | 2.47 ms | 0.92 ms | **8.7x / 23.5x** |
 | oaconvolve | 2^23 × 513 | 27.04 ms | 2.73 ms | 1.32 ms | **9.9x / 20.5x** |
 | correlate (batched) | 64ch × 2^18, 4096 taps | 65.31 ms | 7.08 ms | 4.63 ms | **9.2x / 14.1x** |
-| correlate (auto) | 2^20 autocorrelation | 21.46 ms | 3.48 ms | 1.34 ms | **6.2x / 16.1x** |
+| correlate (auto) | 2^20 autocorrelation | 21.14 ms | 1.92 ms | 0.60 ms | **11.0x / 35.5x** |
 | resample_poly | 16ch, 48k→44.1k (147/160) | 120.7 ms | 6.1 ms | 3.9 ms | **19.7x / 31.0x** |
 | upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.6 ms | 7.5 ms | 5.5 ms | **40.4x / 55.2x** |
 | upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 182.7 ms | 3.8 ms | 1.3 ms | **47.6x / 145.4x** |
@@ -186,8 +186,10 @@ rather than hidden.
   (rel. error ~1.0). mlx-signal verified the safe region empirically and works
   around it on the GPU: 1-D transforms use an in-library four-step (Bailey)
   decomposition into safe-size sub-FFTs (`_fourstep.py`), and long×short
-  `fftconvolve` switches to blocked overlap-add (equal-size pairs run their
-  padded FFTs through the four-step path directly). Only unsplittable lengths
+  `fftconvolve` switches to blocked overlap-add. Equal-size real pairs and
+  autocorrelations at these lengths stay in the even/odd packed domain end to
+  end — the product spectrum's inverse-transform input is computed directly
+  from the packed forward transforms, so the untangle passes never run. Only unsplittable lengths
   (large primes) and the N-d FFT paths route through the MLX CPU stream
   (`_fft_core.py`). When MLX
   fixes this, relaxing one predicate retires the workaround. (Worth reporting

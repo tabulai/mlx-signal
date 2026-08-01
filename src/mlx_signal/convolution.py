@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
-from . import _ola_metal, _stft_metal
+from . import _fourstep, _ola_metal, _stft_metal
 from ._array import result_to_mlx, signal_np, to_mlx
 from ._config import use_mlx
 from ._fft import next_fast_len
@@ -177,13 +177,21 @@ def _freq_domain_conv(a1, a2, axes, shape, same_input=False):
             sp1 = _sfft.fft(a1, n=fl, axis=ax)
             sp2 = sp1 if same_input else _sfft.fft(a2, n=fl, axis=ax)
             ret = _sfft.ifft(sp1 * sp2, n=fl, axis=ax)
-        elif same_input:
-            sp1 = _sfft.rfft(a1, n=fl, axis=ax)
-            ret = _sfft.irfft(sp1 * sp1, n=fl, axis=ax)
         else:
-            sp1 = _sfft.rfft(a1, n=fl, axis=ax)
-            sp2 = _sfft.rfft(a2, n=fl, axis=ax)
-            ret = _sfft.irfft(sp1 * sp2, n=fl, axis=ax)
+            # at direct Metal sizes the plain path wins (the FFT is launch-
+            # bound, so packing's extra passes cost more than they save); at
+            # broken lengths the packed pair replaces the rfft_large/
+            # irfft_large untangle machinery and runs ~2x faster
+            ret = None
+            if _sfft.metal_fft_broken(fl):
+                ret = _fourstep.rfft_conv_pair(a1, a1 if same_input else a2, fl, axis=ax)
+            if ret is None and same_input:
+                sp1 = _sfft.rfft(a1, n=fl, axis=ax)
+                ret = _sfft.irfft(sp1 * sp1, n=fl, axis=ax)
+            elif ret is None:
+                sp1 = _sfft.rfft(a1, n=fl, axis=ax)
+                sp2 = _sfft.rfft(a2, n=fl, axis=ax)
+                ret = _sfft.irfft(sp1 * sp2, n=fl, axis=ax)
     elif complex_result:
         sp1 = _sfft.fftn(a1, s=fshape, axes=axes)
         sp2 = sp1 if same_input else _sfft.fftn(a2, s=fshape, axes=axes)
@@ -409,8 +417,16 @@ def _autocorrelate(x: mx.array, orig, mode: str) -> mx.array:
         return _apply_conv_mode(ret, s1, s1, mode, axes)
     complex_input = x.dtype == mx.complex64
     fshape = [next_fast_len(shape[a]) for a in axes]
+    fslice = tuple(slice(shape[a]) if a in axes else slice(None) for a in range(x.ndim))
     if len(axes) == 1:
         ax, fl = axes[0], fshape[0]
+        if not complex_input and _sfft.metal_fft_broken(fl):
+            # at broken lengths the packed autocorrelation (one half-length
+            # FFT, fused product, one inverse) beats rfft+twiddle+irfft,
+            # whose rfft_large/irfft_large untangle passes it never runs
+            ret = _fourstep.rfft_autocorr(x, fl, axis=ax)
+            if ret is not None:
+                return _apply_conv_mode(ret[fslice], s1, s1, mode, axes)
         sp = _sfft.fft(x, n=fl, axis=ax) if complex_input else _sfft.rfft(x, n=fl, axis=ax)
     else:
         sp = (_sfft.fftn(x, s=fshape, axes=axes) if complex_input
@@ -429,7 +445,6 @@ def _autocorrelate(x: mx.array, orig, mode: str) -> mx.array:
     else:
         ret = (_sfft.ifftn(prod, s=fshape, axes=axes) if complex_input
                else _sfft.irfftn(prod, s=fshape, axes=axes))
-    fslice = tuple(slice(shape[a]) if a in axes else slice(None) for a in range(x.ndim))
     return _apply_conv_mode(ret[fslice], s1, s1, mode, axes)
 
 

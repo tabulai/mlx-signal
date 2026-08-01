@@ -215,3 +215,32 @@ def test_correlate_same_object_autocorr_peak(rng):
     r = np.array(msig.correlate(x, x, mode="full"))
     assert int(np.argmax(r)) == x.size - 1
     np.testing.assert_allclose(r[x.size - 1], float(np.dot(x, x)), rtol=1e-5)
+
+
+def test_fftconvolve_pair_broadcast_batch_fourstep(rng):
+    """Mismatched batch dims can't stack into one batched FFT; the packed
+    path must transform separately and broadcast the product."""
+    n = (1 << 19) + 7  # fl = 2^21: packed-pair path
+    a = rng.standard_normal((4, n)).astype(np.float32)
+    b = rng.standard_normal((1, n)).astype(np.float32)
+    assert_close(msig.fftconvolve(a, b, axes=[1]), sps.fftconvolve(a, b, axes=[1]),
+                 rtol=2e-4, atol_frac=2e-5)
+
+
+def test_fftconvolve_same_object_fourstep(rng):
+    """Auto-convolution at a broken Metal length runs the packed-pair path
+    with a single forward transform."""
+    x = rng.standard_normal((1 << 19) + 21).astype(np.float32)
+    assert_close(msig.fftconvolve(x, x), sps.fftconvolve(x, x), rtol=2e-4, atol_frac=2e-5)
+
+
+@pytest.mark.parametrize("length", [(1 << 19) + 20, (1 << 19) + 21])  # even, odd
+@pytest.mark.parametrize("mode", ["full", "same", "valid"])
+def test_correlate_same_object_fourstep(rng, length, mode):
+    """Autocorrelation at broken Metal lengths uses the packed identity
+    (odd lengths take the zero-prepend realignment branch)."""
+    x = rng.standard_normal(length).astype(np.float32)
+    ref = sps.correlate(x, x, mode=mode, method="fft")
+    out = msig.correlate(x, x, mode=mode)
+    assert ref.shape == tuple(np.array(out).shape)
+    assert_close(out, ref, rtol=2e-4, atol_frac=2e-5)
