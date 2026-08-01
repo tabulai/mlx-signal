@@ -16,7 +16,7 @@ import numpy as np
 
 from . import _fft_core as _sfft
 from . import _ola_metal, _stft_metal
-from ._array import result_to_mlx, to_mlx, to_numpy
+from ._array import result_to_mlx, signal_np, to_mlx
 from ._config import use_mlx
 from ._fft import next_fast_len
 
@@ -33,10 +33,17 @@ def _normalize_axes(ndim: int, axes) -> list[int]:
         return list(range(ndim))
     if np.isscalar(axes):
         axes = [axes]
-    axes = [int(a) % ndim for a in axes]
-    if len(set(axes)) != len(axes):
+    checked = []
+    for a in axes:
+        if not isinstance(a, int | np.integer):
+            raise ValueError("axes must be a scalar or iterable of integers")
+        a = int(a)
+        if not -ndim <= a < ndim:
+            raise ValueError("axes exceeds dimensionality of input")
+        checked.append(a % ndim)
+    if len(set(checked)) != len(checked):
         raise ValueError("all axes must be unique")
-    return axes
+    return checked
 
 
 def _inputs_swap_needed(mode, shape1, shape2, axes=None) -> bool:
@@ -119,6 +126,7 @@ def fftconvolve(in1, in2, mode="full", axes=None):
     if a1.size == 0 or a2.size == 0:
         return mx.zeros((0,), dtype=a1.dtype)
 
+    axes_arg = axes
     a1, a2, axes = _init_conv_axes(a1, a2, mode, axes, sorted_axes=False)
     s1, s2 = a1.shape, a2.shape
     shape = [
@@ -128,7 +136,8 @@ def fftconvolve(in1, in2, mode="full", axes=None):
     if not use_mlx(int(np.prod(shape))):
         import scipy.signal as sps
 
-        out = sps.fftconvolve(to_numpy(in1), to_numpy(in2), mode=mode, axes=axes or None)
+        out = sps.fftconvolve(signal_np(in1), signal_np(in2), mode=mode,
+                              axes=axes_arg)
         return result_to_mlx(out)
 
     # A long x short convolution runs as blocked overlap-add when the padded
@@ -187,6 +196,7 @@ def oaconvolve(in1, in2, mode="full", axes=None):
     if a1.shape == a2.shape:
         return fftconvolve(in1, in2, mode=mode, axes=axes)
 
+    axes_arg = axes
     a1, a2, axes = _init_conv_axes(a1, a2, mode, axes, sorted_axes=True)
     s1, s2 = a1.shape, a2.shape
 
@@ -202,7 +212,8 @@ def oaconvolve(in1, in2, mode="full", axes=None):
     if not use_mlx(int(np.prod([max(s1[i], s2[i]) for i in range(a1.ndim)]))):
         import scipy.signal as sps
 
-        out = sps.oaconvolve(to_numpy(in1), to_numpy(in2), mode=mode, axes=axes or None)
+        out = sps.oaconvolve(signal_np(in1), signal_np(in2), mode=mode,
+                              axes=axes_arg)
         return result_to_mlx(out)
 
     # long input first for the blocked computation (convolution commutes; the
@@ -309,7 +320,7 @@ def convolve(in1, in2, mode="full", method="auto"):
     if method == "direct":
         import scipy.signal as sps
 
-        return result_to_mlx(sps.convolve(to_numpy(in1), to_numpy(in2), mode=mode,
+        return result_to_mlx(sps.convolve(signal_np(in1), signal_np(in2), mode=mode,
                                           method="direct"))
     return fftconvolve(in1, in2, mode=mode)
 
@@ -335,7 +346,7 @@ def correlate(in1, in2, mode="full", method="auto"):
     if method == "direct":
         import scipy.signal as sps
 
-        return result_to_mlx(sps.correlate(to_numpy(in1), to_numpy(in2), mode=mode,
+        return result_to_mlx(sps.correlate(signal_np(in1), signal_np(in2), mode=mode,
                                            method="direct"))
     return fftconvolve(a1, _reverse_and_conj(a2), mode=mode)
 

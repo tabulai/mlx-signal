@@ -10,11 +10,13 @@ better-conditioned SOS form, as scipy itself recommends.
 
 from __future__ import annotations
 
+import functools as _functools
+
 import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
-from ._array import input_size, result_to_mlx, to_mlx, to_numpy
+from ._array import input_size, result_to_mlx, signal_np, to_mlx, to_numpy
 from ._arraytools import const_ext, even_ext, odd_ext
 from ._config import capability_fallback, get_config, use_mlx
 from ._sosfilt_metal import SCAN_BLOCK as _SCAN_BLOCK_REF
@@ -41,7 +43,7 @@ def hilbert(x, N=None, axis=-1):
     if not use_mlx(max(input_size(x), N)):
         import scipy.signal as sps
 
-        return result_to_mlx(sps.hilbert(to_numpy(x), N=N, axis=axis))
+        return result_to_mlx(sps.hilbert(signal_np(x), N=N, axis=axis))
 
     xa = mx.moveaxis(xa, axis, -1) if xa.ndim > 1 else xa
     Xf = _sfft.fft(xa.astype(mx.complex64), n=N, axis=-1)
@@ -122,14 +124,14 @@ def lfilter(b, a, x, axis=-1, zi=None):
     with a FallbackWarning (IIR-via-associative-scan is on the roadmap).
     """
     taps = _as_fir_taps(b, a)
-    work = input_size(x)
+    work = input_size(x) * (1 if taps is None else max(1, taps.size))
     if taps is None or zi is not None or not use_mlx(work):
         if use_mlx(work):  # not a size decision: explain why we left the GPU
             reason = "zi initial conditions" if taps is not None else "IIR filtering (len(a) > 1)"
             capability_fallback("lfilter", reason)
         import scipy.signal as sps
 
-        out = sps.lfilter(to_numpy(b), to_numpy(a), to_numpy(x), axis=axis, zi=zi)
+        out = sps.lfilter(to_numpy(b), to_numpy(a), signal_np(x), axis=axis, zi=zi)
         if zi is not None:
             return result_to_mlx(out[0]), result_to_mlx(out[1])
         return result_to_mlx(out)
@@ -157,7 +159,7 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
         raise ValueError("method must be 'pad' or 'gust'.")
 
     taps = _as_fir_taps(b, a)
-    work = input_size(x)
+    work = input_size(x) * (1 if taps is None else max(1, taps.size))
     if taps is None or method == "gust" or not use_mlx(work):
         if use_mlx(work):
             reason = "method='gust'" if taps is not None else "IIR filtering (len(a) > 1)"
@@ -165,7 +167,7 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.filtfilt(to_numpy(b), to_numpy(a), to_numpy(x), axis=axis,
+            sps.filtfilt(to_numpy(b), to_numpy(a), signal_np(x), axis=axis,
                          padtype=padtype, padlen=padlen, method=method, irlen=irlen)
         )
 
@@ -236,9 +238,24 @@ def _validate_sos_np(sos) -> np.ndarray:
         raise ValueError("sos array must be 2D")
     if sos.shape[1] != 6:
         raise ValueError("sos array must be shape (n_sections, 6)")
+    if sos.shape[0] < 1:
+        raise ValueError("sos array must have at least one section")
     if not np.all(sos[:, 3] == 1):
         raise ValueError("sos[:, 3] should be all ones")
     return sos
+
+
+@_functools.lru_cache(maxsize=64)
+def _scan_safe(sos_bytes: bytes, n_sections: int) -> bool:
+    """Block-composed state propagation loses float32 accuracy when poles sit
+    essentially on the unit circle (very narrowband filters); those stay on the
+    exact per-channel-sequential kernel."""
+    sos = np.frombuffer(sos_bytes, dtype=np.float64).reshape(n_sections, 6)
+    for a1, a2 in sos[:, 4:6]:
+        radius = np.max(np.abs(np.roots([1.0, a1, a2]))) if (a1 or a2) else 0.0
+        if radius > 1.0 - 1e-4:
+            return False
+    return True
 
 
 def _zi_expected_shape(n_sections, x_shape, axis):
@@ -292,7 +309,7 @@ def sosfilt(sos, x, axis=-1, zi=None):
     def _scipy_path():
         import scipy.signal as sps
 
-        out = sps.sosfilt(sos_np, to_numpy(x), axis=axis,
+        out = sps.sosfilt(sos_np, signal_np(x), axis=axis,
                           zi=to_numpy(zi) if zi is not None else None)
         if zi is not None:
             return result_to_mlx(out[0]), result_to_mlx(out[1])
@@ -307,7 +324,7 @@ def sosfilt(sos, x, axis=-1, zi=None):
                   else "no Metal GPU")
         capability_fallback("sosfilt", reason)
         return _scipy_path()
-    use_scan = n >= _SCAN_MIN_N
+    use_scan = n >= _SCAN_MIN_N and _scan_safe(sos_np.tobytes(), n_sections)
     if (
         get_config().dispatch == "auto"
         and not use_scan
@@ -376,11 +393,13 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
     sos_np = _validate_sos_np(sos)
     n_sections = sos_np.shape[0]
 
-    if not use_mlx(input_size(x) * n_sections):
+    if np.iscomplexobj(sos_np):
+        capability_fallback("sosfiltfilt", "complex sos coefficients")
+    if np.iscomplexobj(sos_np) or not use_mlx(input_size(x) * n_sections):
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.sosfiltfilt(sos_np, to_numpy(x), axis=axis, padtype=padtype,
+            sps.sosfiltfilt(sos_np, signal_np(x), axis=axis, padtype=padtype,
                             padlen=padlen)
         )
 

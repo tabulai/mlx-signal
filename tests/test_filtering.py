@@ -6,6 +6,7 @@ import scipy.signal as sps
 
 import mlx_signal as msig
 from _utils import assert_close, assert_type_and_dtype
+from conftest import HAS_GPU
 
 
 def test_firwin_matches_scipy():
@@ -68,19 +69,20 @@ def test_lfilter_taps_longer_than_signal(rng):
 def test_lfilter_iir_falls_back(rng):
     x = rng.standard_normal(1000).astype(np.float32)
     b, a = sps.butter(4, 0.2)
-    with msig.config_context(dispatch="auto", gpu_min_size=1):
+    with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
         with pytest.warns(msig.FallbackWarning):
             out = msig.lfilter(b, a, x)
     assert_close(out, sps.lfilter(b, a, x), rtol=1e-3)
-    with pytest.raises(NotImplementedError):
-        msig.lfilter(b, a, x)  # dispatch="mlx" pinned by fixture
+    if HAS_GPU:  # fixture pins dispatch="mlx" only when Metal exists
+        with pytest.raises(NotImplementedError):
+            msig.lfilter(b, a, x)
 
 
 def test_lfilter_zi_falls_back(rng):
     b = np.array(msig.firwin(9, 0.3))
     x = rng.standard_normal(300).astype(np.float32)
     zi = sps.lfilter_zi(b, [1.0]) * x[0]
-    with msig.config_context(dispatch="auto", gpu_min_size=1):
+    with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
         with pytest.warns(msig.FallbackWarning):
             y, zf = msig.lfilter(b, [1.0], x, zi=zi)
     y_ref, zf_ref = sps.lfilter(b, [1.0], x, zi=zi)
@@ -123,7 +125,7 @@ def test_filtfilt_padlen_too_long(rng):
 def test_filtfilt_iir_falls_back(rng):
     x = rng.standard_normal(1000).astype(np.float32)
     b, a = sps.butter(3, 0.1)
-    with msig.config_context(dispatch="auto", gpu_min_size=1):
+    with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
         with pytest.warns(msig.FallbackWarning):
             out = msig.filtfilt(b, a, x)
     assert_close(out, sps.filtfilt(b, a, x), rtol=1e-3)

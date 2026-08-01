@@ -6,7 +6,7 @@ import scipy.signal as sps
 
 import mlx_signal as msig
 from _utils import assert_close, assert_type_and_dtype
-from conftest import requires_gpu
+from conftest import HAS_GPU, requires_gpu
 from mlx_signal.resampling import _upfirdn_composed
 
 UPFIRDN_CASES = [
@@ -87,12 +87,13 @@ def test_kernel_agrees_with_composed_path(rng, n, up, down, n_taps):
 def test_upfirdn_pad_mode_falls_back(rng):
     x = rng.standard_normal(300).astype(np.float32)
     h = rng.standard_normal(21).astype(np.float32)
-    with msig.config_context(dispatch="auto", gpu_min_size=1):
+    with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
         with pytest.warns(msig.FallbackWarning):
             out = msig.upfirdn(h, x, 2, 1, mode="smooth")
     assert_close(out, sps.upfirdn(h, x, 2, 1, mode="smooth"))
-    with pytest.raises(NotImplementedError):
-        msig.upfirdn(h, x, 2, 1, mode="smooth")  # dispatch="mlx" pinned by fixture
+    if HAS_GPU:  # fixture pins dispatch="mlx" only when Metal exists
+        with pytest.raises(NotImplementedError):
+            msig.upfirdn(h, x, 2, 1, mode="smooth")
 
 
 RESAMPLE_POLY_CASES = [(2, 1), (1, 2), (3, 2), (2, 3), (160, 147), (7, 3), (4, 2), (5, 5)]
@@ -178,12 +179,13 @@ def test_decimate_iir_matches_scipy(rng):
 def test_decimate_dlti_falls_back(rng):
     x = rng.standard_normal(1000).astype(np.float32)
     system = sps.dlti(*sps.cheby1(6, 0.05, 0.2))
-    with msig.config_context(dispatch="auto", gpu_min_size=1):
+    with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
         with pytest.warns(msig.FallbackWarning):
             out = msig.decimate(x, 4, ftype=system)
     assert_close(out, sps.decimate(x, 4, ftype=system), rtol=1e-3, atol_frac=1e-4)
-    with pytest.raises(NotImplementedError):
-        msig.decimate(x, 4, ftype=system)  # dispatch="mlx" pinned by fixture
+    if HAS_GPU:
+        with pytest.raises(NotImplementedError):
+            msig.decimate(x, 4, ftype=system)
 
 
 @pytest.mark.parametrize("n,up,down,n_taps", [(2000, 3, 2, 6000), (1500, 2, 5, 4097)])

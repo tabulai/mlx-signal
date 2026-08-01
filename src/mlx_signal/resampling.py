@@ -14,7 +14,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import _fft_core as _sfft
-from ._array import input_size, result_to_mlx, to_mlx, to_numpy
+from ._array import input_size, result_to_mlx, signal_np, to_mlx, to_numpy
 from ._config import capability_fallback, use_mlx
 from ._upfirdn_metal import upfirdn_gpu
 from .convolution import fftconvolve
@@ -24,24 +24,33 @@ __all__ = ["decimate", "resample", "resample_poly", "upfirdn"]
 
 
 def _freq_window(window, n_x: int) -> np.ndarray:
-    """Resolve the frequency-domain window to float64 host values (fftfreq order)."""
+    """Resolve the frequency-domain window to 64-bit host values (fftfreq order).
+
+    Complex windows are preserved — scipy applies them as-is.
+    """
     if callable(window):
-        w = np.asarray(window(np.fft.fftfreq(n_x)), dtype=np.float64)
+        w = np.asarray(window(np.fft.fftfreq(n_x)))
         if w.shape != (n_x,):
             raise ValueError(
                 f"window function returned shape {w.shape}, expected ({n_x},)"
             )
-        return w
-    if isinstance(window, str | tuple):
+    elif isinstance(window, str | tuple):
         key = tuple(window) if isinstance(window, tuple) else window
-        return np.fft.fftshift(_window_np(key, n_x)).copy()
-    w = np.asarray(to_numpy(window), dtype=np.float64)
-    if w.shape != (n_x,):
-        raise ValueError(
-            f"window.shape={w.shape} != ({n_x},), i.e., window length is not "
-            "equal to number of frequency bins!"
-        )
-    return w.copy()
+        w = np.fft.fftshift(_window_np(key, n_x))
+    else:
+        w = np.asarray(to_numpy(window))
+        if w.shape != (n_x,):
+            raise ValueError(
+                f"window.shape={w.shape} != ({n_x},), i.e., window length is not "
+                "equal to number of frequency bins!"
+            )
+    dtype = np.complex128 if np.iscomplexobj(w) else np.float64
+    return np.array(w, dtype=dtype)
+
+
+def _win32(w: np.ndarray) -> mx.array:
+    """Host window values as the matching 32-bit MLX array."""
+    return mx.array(w.astype(np.complex64 if np.iscomplexobj(w) else np.float32))
 
 
 def resample(x, num, t=None, axis=0, window=None, domain="time"):
@@ -59,7 +68,7 @@ def resample(x, num, t=None, axis=0, window=None, domain="time"):
         win = window
         if win is not None and not (isinstance(win, str | tuple) or callable(win)):
             win = to_numpy(win)
-        out = sps.resample(to_numpy(x), num, t=to_numpy(t) if t is not None else None,
+        out = sps.resample(signal_np(x), num, t=to_numpy(t) if t is not None else None,
                            axis=axis, window=win, domain=domain)
         if t is not None:
             return result_to_mlx(out[0]), result_to_mlx(out[1])
@@ -85,7 +94,7 @@ def resample(x, num, t=None, axis=0, window=None, domain="time"):
             Wf = W.copy()
             Wf[1:n_X] += np.flip(Wf[-n_X + 1 :])
             Wf[1:n_X] /= 2
-            X = X * mx.array(Wf[:n_X].astype(np.float32))
+            X = X * _win32(Wf[:n_X])
         X = X[..., :m2]
         if m % 2 == 0 and num != n_x:  # unpaired bin at m//2
             fac = np.ones(m2, dtype=np.float32)
@@ -99,7 +108,7 @@ def resample(x, num, t=None, axis=0, window=None, domain="time"):
         else:
             X = xa if xa.dtype == mx.complex64 else xa.astype(mx.complex64)
         if W is not None:
-            X = X * mx.array(W.astype(np.float32))
+            X = X * _win32(W)
 
         parts: list[mx.array] = []
         first = X[..., :m2]
@@ -199,16 +208,20 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.upfirdn(to_numpy(h), to_numpy(x), up=up, down=down, axis=axis,
+            sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down, axis=axis,
                         mode=mode, cval=cval)
         )
 
     xa = to_mlx(x)
     n_in = xa.shape[axis]
-    if n_in == 0:
-        raise ValueError("x must have at least one sample along axis")
     n_taps = ha.shape[0]
     n_out = _output_len(n_taps, n_in, up, down)
+    if n_in == 0:  # scipy returns zeros of the formula-implied output length
+        shape = list(xa.shape)
+        shape[axis] = max(0, n_out)
+        dtype = (mx.complex64 if mx.complex64 in (xa.dtype, ha.dtype)
+                 else mx.float32)
+        return mx.zeros(tuple(shape), dtype=dtype)
     batch = xa.size // n_in
     # per-output-sample dot product length is ~n_taps/up
     work = batch * n_out * max(1, n_taps // up)
@@ -217,7 +230,7 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.upfirdn(to_numpy(h), to_numpy(x), up=up, down=down, axis=axis)
+            sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down, axis=axis)
         )
 
     moved = xa.ndim > 1
@@ -262,7 +275,7 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
 
         win = window if isinstance(window, str | tuple) else to_numpy(window)
         return result_to_mlx(
-            sps.resample_poly(to_numpy(x), up, down, axis=axis, window=win,
+            sps.resample_poly(signal_np(x), up, down, axis=axis, window=win,
                               padtype=padtype, cval=cval)
         )
 
@@ -285,7 +298,9 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
         half_len = 10 * max_rate
         h_np = np.asarray(firwin(2 * half_len + 1, f_c, window=window), dtype=np.float64)
     else:
-        h_np = np.array(to_numpy(window), dtype=np.float64)
+        w_np = to_numpy(window)
+        h_np = np.array(w_np, dtype=np.complex128 if np.iscomplexobj(w_np)
+                        else np.float64)
         if h_np.ndim != 1:
             raise ValueError("window must be 1-D")
         half_len = (h_np.size - 1) // 2
@@ -299,10 +314,14 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
         n_out + n_pre_remove
     ):
         n_post_pad += 1
-    h_full = np.concatenate([np.zeros(n_pre_pad), h_np, np.zeros(n_post_pad)])
+    h_full = np.concatenate([
+        np.zeros(n_pre_pad, dtype=h_np.dtype), h_np,
+        np.zeros(n_post_pad, dtype=h_np.dtype),
+    ])
     n_pre_remove_end = n_pre_remove + n_out
 
-    y = upfirdn(h_full.astype(np.float32), xa, up, down, axis=axis)
+    h32 = h_full.astype(np.complex64 if np.iscomplexobj(h_full) else np.float32)
+    y = upfirdn(h32, xa, up, down, axis=axis)
     keep = [slice(None)] * y.ndim
     keep[axis] = slice(n_pre_remove, n_pre_remove_end)
     return y[tuple(keep)]
@@ -341,7 +360,7 @@ def decimate(x, q, n=None, ftype="iir", axis=-1, zero_phase=True):
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.decimate(to_numpy(x), q, n=n, ftype=ftype, axis=axis,
+            sps.decimate(signal_np(x), q, n=n, ftype=ftype, axis=axis,
                          zero_phase=zero_phase)
         )
 

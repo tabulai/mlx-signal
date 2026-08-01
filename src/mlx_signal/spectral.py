@@ -21,7 +21,7 @@ import numpy as np
 
 from . import _fft_core as _sfft
 from . import _stft_metal
-from ._array import input_size, result_to_mlx, to_mlx, to_numpy
+from ._array import input_size, result_to_mlx, signal_np, to_mlx, to_numpy
 from ._arraytools import const_ext, even_ext, odd_ext, zero_ext
 from ._config import capability_fallback, use_mlx
 from .windows import _window_np
@@ -407,12 +407,26 @@ def csd(
     """
     if average not in ("mean", "median"):
         raise ValueError(f"average must be 'mean' or 'median', got {average!r}")
+    if input_size(x) == 0 or input_size(y) == 0:
+        # mirror scipy's empty-input shapes without entering the averaging path
+        if y is x:
+            e = _empty_like_shape(to_mlx(x).shape)
+            return e, e
+        xa, ya = to_mlx(x), to_mlx(y)
+        xouter, youter = list(xa.shape), list(ya.shape)
+        xouter.pop(axis)
+        youter.pop(axis)
+        outshape = np.broadcast_shapes(tuple(xouter), tuple(youter)) + (
+            min(xa.shape[axis], ya.shape[axis]),
+        )
+        e = mx.moveaxis(_empty_like_shape(outshape), -1, axis)
+        return e, e
     if not _mlx_or_fallback("csd", max(input_size(x), input_size(y)), detrend):
         import scipy.signal as sps
 
         f, p = sps.csd(
-            to_numpy(x),
-            to_numpy(y) if y is not x else to_numpy(x),
+            signal_np(x),
+            signal_np(y) if y is not x else signal_np(x),
             fs=fs,
             window=_window_arg_np(window),
             nperseg=nperseg,
@@ -633,7 +647,7 @@ def spectrogram(
         import scipy.signal as sps
 
         f, t, s = sps.spectrogram(
-            to_numpy(x),
+            signal_np(x),
             fs=fs,
             window=_window_arg_np(window),
             nperseg=nperseg,
@@ -694,7 +708,7 @@ def stft(
         import scipy.signal as sps
 
         f, t, z = sps.stft(
-            to_numpy(x),
+            signal_np(x),
             fs=fs,
             window=_window_arg_np(window),
             nperseg=nperseg,
@@ -757,7 +771,7 @@ def istft(
         import scipy.signal as sps
 
         t, x = sps.istft(
-            to_numpy(Zxx),
+            signal_np(Zxx),
             fs=fs,
             window=_window_arg_np(window),
             nperseg=nperseg,

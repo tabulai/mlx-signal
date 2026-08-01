@@ -262,7 +262,10 @@ def sosfilt_scan_gpu(x2d: mx.array, sos_np, zi: mx.array, L: int = SCAN_BLOCK):
     K = -(-n // L)
     p1, p2, p3 = _scan_kernels(S, L)
     sos_flat = mx.array(np.ascontiguousarray(sos_np, dtype=np.float32).reshape(-1))
-    AL = _transition_power(np.ascontiguousarray(sos_np, np.float64).tobytes(), S, L)
+    # derive A^L from the float32-ROUNDED coefficients so the block transition
+    # models exactly the filter the float32 kernels run
+    sos32 = np.ascontiguousarray(sos_np, np.float64).astype(np.float32).astype(np.float64)
+    AL = _transition_power(sos32.tobytes(), S, L)
     params = mx.array([B, n, K], dtype=mx.int32)
 
     (d,) = p1(

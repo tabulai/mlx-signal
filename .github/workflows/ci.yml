@@ -29,3 +29,6 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: python -m pytest -q
+      # exercise the no-Metal code paths explicitly (auto dispatch + scipy
+      # fallback for kernel-only capabilities), even if the runner has a GPU
+      - run: MLX_SIGNAL_SIMULATE_NO_METAL=1 python -m pytest -q

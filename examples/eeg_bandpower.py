@@ -37,9 +37,12 @@ def make_eeg() -> np.ndarray:
     return eeg + 8.0 * gain * alpha
 
 
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz  # numpy < 2.0 compat
+
+
 def band_power(freqs: np.ndarray, psd: np.ndarray, lo: float, hi: float) -> np.ndarray:
     sel = (freqs >= lo) & (freqs <= hi)
-    return np.trapezoid(psd[:, sel], freqs[sel], axis=-1)
+    return _trapezoid(psd[:, sel], freqs[sel], axis=-1)
 
 
 def main():

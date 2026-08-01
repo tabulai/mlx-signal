@@ -12,6 +12,7 @@ import scipy.signal as sps
 
 import mlx_signal as msig
 from _utils import assert_close, assert_type_and_dtype
+from conftest import HAS_GPU
 
 FILTERS = [
     sps.butter(4, 0.2, output="sos"),
@@ -20,6 +21,11 @@ FILTERS = [
     sps.ellip(6, 0.1, 60, 0.3, output="sos"),
     sps.butter(1, 0.5, output="sos"),  # single section
 ]
+
+
+# with a GPU the kernel is bit-identical to scipy-in-float32; without Metal the
+# scipy fallback computes in float64, so comparisons loosen accordingly
+_EXACT_RTOL = 1e-6 if HAS_GPU else 1e-4
 
 
 def _f32_ref(sos, x, axis=-1, zi=None):
@@ -34,8 +40,8 @@ def test_sosfilt_matches_scipy_f32_exact(rng, sos, shape):
     out = msig.sosfilt(sos, x)
     assert_type_and_dtype(out)
     assert ref.shape == tuple(np.array(out).shape)
-    np.testing.assert_allclose(np.array(out), ref, rtol=1e-6,
-                               atol=1e-6 * np.abs(ref).max())
+    np.testing.assert_allclose(np.array(out), ref, rtol=_EXACT_RTOL,
+                               atol=_EXACT_RTOL * np.abs(ref).max())
 
 
 @pytest.mark.parametrize("sos", FILTERS[:2])
@@ -50,8 +56,8 @@ def test_sosfilt_axis0(rng):
     sos = FILTERS[0]
     x = rng.standard_normal((20000, 6)).astype(np.float32)
     ref = _f32_ref(sos, x, axis=0)
-    np.testing.assert_allclose(np.array(msig.sosfilt(sos, x, axis=0)), ref, rtol=1e-6,
-                               atol=1e-6 * np.abs(ref).max())
+    np.testing.assert_allclose(np.array(msig.sosfilt(sos, x, axis=0)), ref, rtol=_EXACT_RTOL,
+                               atol=_EXACT_RTOL * np.abs(ref).max())
 
 
 def test_sosfilt_zi_roundtrip(rng):
@@ -61,8 +67,8 @@ def test_sosfilt_zi_roundtrip(rng):
     zi = rng.standard_normal((S, 5, 2)).astype(np.float32)
     y_ref, zf_ref = _f32_ref(sos, x, zi=zi)
     y, zf = msig.sosfilt(sos, x, zi=zi)
-    np.testing.assert_allclose(np.array(y), y_ref, rtol=1e-6,
-                               atol=1e-6 * np.abs(y_ref).max())
+    np.testing.assert_allclose(np.array(y), y_ref, rtol=_EXACT_RTOL,
+                               atol=_EXACT_RTOL * np.abs(y_ref).max())
     np.testing.assert_allclose(np.array(zf), zf_ref, rtol=1e-5,
                                atol=1e-5 * max(np.abs(zf_ref).max(), 1e-9))
 
@@ -121,13 +127,14 @@ def test_sosfilt_many_sections_falls_back(rng):
     stable = sps.butter(2, 0.3, output="sos")
     sos = np.tile(stable, (20, 1))  # 20 sections > kernel cap
     x = rng.standard_normal((10, 5000)).astype(np.float32)
-    with msig.config_context(dispatch="auto", gpu_min_size=1):
+    with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
         with pytest.warns(msig.FallbackWarning):
             out = msig.sosfilt(sos, x)
     np.testing.assert_allclose(np.array(out), _f32_ref(sos, x), rtol=1e-4,
                                atol=1e-4 * np.abs(np.array(out)).max())
-    with pytest.raises(NotImplementedError):
-        msig.sosfilt(sos, x)  # dispatch="mlx" pinned by fixture
+    if HAS_GPU:  # fixture pins dispatch="mlx" only when Metal exists
+        with pytest.raises(NotImplementedError):
+            msig.sosfilt(sos, x)
 
 
 def test_sosfilt_single_channel_uses_scan_under_auto(rng):
@@ -148,8 +155,8 @@ def test_sosfilt_short_signal_sequential_kernel(rng):
     sos = FILTERS[1]
     x = rng.standard_normal((40, 1500)).astype(np.float32)
     ref = _f32_ref(sos, x)
-    np.testing.assert_allclose(np.array(msig.sosfilt(sos, x)), ref, rtol=1e-6,
-                               atol=1e-6 * np.abs(ref).max())
+    np.testing.assert_allclose(np.array(msig.sosfilt(sos, x)), ref, rtol=_EXACT_RTOL,
+                               atol=_EXACT_RTOL * np.abs(ref).max())
 
 
 def test_scan_and_sequential_kernels_agree(rng):

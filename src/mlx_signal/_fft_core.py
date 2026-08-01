@@ -41,8 +41,21 @@ def _kw(n: int) -> dict:
     return {"stream": mx.cpu} if metal_fft_broken(int(n)) else {}
 
 
+def _one_point(a: mx.array, axis: int) -> mx.array:
+    """First element along ``axis`` (zero if the axis is empty), length-1 axis kept."""
+    ax = axis % a.ndim
+    if a.shape[ax] >= 1:
+        sl = [slice(None)] * a.ndim
+        sl[ax] = slice(0, 1)
+        return a[tuple(sl)]
+    shape = tuple(1 if i == ax else d for i, d in enumerate(a.shape))
+    return mx.zeros(shape, dtype=a.dtype)
+
+
 def rfft(a, n=None, axis=-1):
     length = int(a.shape[axis] if n is None else n)
+    if length == 1:  # MLX's Metal length-1 batched rfft returns garbage
+        return _one_point(a, axis).astype(mx.complex64)
     if metal_fft_broken(length):
         from . import _fourstep
 
@@ -54,6 +67,8 @@ def rfft(a, n=None, axis=-1):
 
 def irfft(a, n=None, axis=-1):
     length = int(2 * (a.shape[axis] - 1) if n is None else n)
+    if length == 1:  # irfft to one sample is the real part of bin 0
+        return mx.real(_one_point(a, axis)).astype(mx.float32)
     if metal_fft_broken(length):
         from . import _fourstep
 
@@ -65,6 +80,8 @@ def irfft(a, n=None, axis=-1):
 
 def fft(a, n=None, axis=-1):
     length = int(a.shape[axis] if n is None else n)
+    if length == 1:  # a one-point DFT is the identity
+        return _one_point(a, axis).astype(mx.complex64)
     if metal_fft_broken(length):
         from . import _fourstep
 
@@ -76,6 +93,8 @@ def fft(a, n=None, axis=-1):
 
 def ifft(a, n=None, axis=-1):
     length = int(a.shape[axis] if n is None else n)
+    if length == 1:  # a one-point inverse DFT is the identity
+        return _one_point(a, axis).astype(mx.complex64)
     if metal_fft_broken(length):
         from . import _fourstep
 

@@ -65,14 +65,19 @@ def set_config(**kwargs) -> None:
     >>> import mlx_signal
     >>> mlx_signal.set_config(dispatch="mlx", warn_on_downcast=False)
     """
-    for key, value in kwargs.items():
+    # validate everything before mutating so a failure leaves state untouched
+    for key in kwargs:
         if not hasattr(_config, key):
             raise TypeError(f"unknown config option {key!r}")
-        setattr(_config, key, value)
-    if _config.dispatch not in _DISPATCH_MODES:
+    if kwargs.get("dispatch", _config.dispatch) not in _DISPATCH_MODES:
         raise ValueError(f"dispatch must be one of {_DISPATCH_MODES}")
-    if _config.float64 not in _FLOAT64_MODES:
+    if kwargs.get("float64", _config.float64) not in _FLOAT64_MODES:
         raise ValueError(f"float64 must be one of {_FLOAT64_MODES}")
+    size = kwargs.get("gpu_min_size", _config.gpu_min_size)
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise ValueError("gpu_min_size must be a non-negative integer")
+    for key, value in kwargs.items():
+        setattr(_config, key, value)
 
 
 @contextlib.contextmanager
