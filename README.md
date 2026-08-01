@@ -72,24 +72,24 @@ and priced honestly at ~1x.
 Other Mac-runnable implementations exist for parts of this API: torch/torchaudio
 (CPU and the MPS GPU backend), `jax.scipy.signal` (XLA CPU), librosa, and soxr.
 Same machine, conventions aligned, every output verified against scipy before
-timing (full details: [bench/results/cross.md](bench/results/cross.md), reproduce
+publication (full details: [bench/results/cross.md](bench/results/cross.md), reproduce
 with `pip install -e ".[bench]" && python bench/bench_cross.py`). End-to-end
 (NumPy in/out), best per row in bold:
 
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| welch, 64ch × 2^20 | 510 ms | **8.5 ms** | — | — | 137 ms | — | — |
-| stft, 16ch × 2^20 | 47 ms | **4.0 ms** | 25 ms | 4.8 ms | 44 ms | 64 ms | — |
-| fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 39 ms | 4.4 ms | 16 ms | — | — |
-| resample 48k→44.1k, 16ch × 2^20 | 123 ms | 6.3 ms¹ | 8.7 ms¹ | **5.7 ms**¹ | — | 57 ms | 54 ms |
-| causal FIR, 64ch × 2^20, 257 taps | 1638 ms | **14 ms** | 2933 ms² | 70 ms² | — | — | — |
+| welch, 64ch × 2^20 | 506 ms | **8.4 ms** | — | — | 137 ms | — | — |
+| stft, 16ch × 2^20 | 46 ms | 6.8 ms | 25 ms | **4.2 ms** | 43 ms | 64 ms | — |
+| fftconvolve, 2^20 × 4097 | 11 ms | **1.7 ms** | 39 ms | 4.3 ms | 16 ms | — | — |
+| resample 48k→44.1k, 16ch × 2^20 | 123 ms | 5.7 ms¹ | 8.3 ms¹ | **5.5 ms**¹ | — | 57 ms | 53 ms |
+| causal FIR, 64ch × 2^20, 257 taps | 1643 ms | **14 ms** | 2855 ms² | 70 ms² | — | — | — |
 
 ¹ Task-level: torchaudio's default anti-aliasing filter (`lowpass_filter_width=6`)
 is far shorter than scipy's/ours (3201 taps here) — mlx-signal matches
 torchaudio-MPS speed while doing ~20x the filter work at scipy-identical quality.
 ² torch has no FFT convolution for filtering, so the idiomatic path is direct
 `conv1d` (O(n·k)); torchaudio's `lfilter` (its general IIR machinery) takes
-**3.4 s on CPU and 21.9 s on MPS** for this FIR case — 1700x slower than
+**3.6 s on CPU and 22.0 s on MPS** for this FIR case — over 1500x slower than
 mlx-signal — which is exactly the patchy-MPS-coverage problem this library exists
 to avoid.
 
@@ -99,9 +99,9 @@ their own two-signal variant of the fused kernel that computes both spectra and
 the cross spectrum in a single sweep (coherence: one pass instead of scipy's
 five). `upfirdn`/`find_peaks` are scipy-only elsewhere. The closest competitor —
 `torch.stft` on MPS — trades the end-to-end lead with mlx-signal run to run
-(both land at 4–5 ms; the NumPy↔GPU copy dominates and wobbles) but loses
+(roughly 4–7 ms here; the NumPy↔GPU copy dominates and wobbles) but loses
 decisively on-device, where the transform itself runs ~3x faster here
-(0.92 ms vs 2.65 ms); and it ships inside a 2 GB torch dependency with the
+(0.93 ms vs 2.61 ms); and it ships inside a 2 GB torch dependency with the
 `lfilter` cliff above. The
 speed comes from a fused Metal kernel (`_stft_metal.py`): one threadgroup per
 segment runs strided load → mean-detrend → window → a full radix-2 Stockham FFT
@@ -120,7 +120,7 @@ Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 ```bash
 git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # 399 golden tests against scipy and NumPy
+python -m pytest -q         # full golden suite against scipy and NumPy
 ```
 
 (PyPI release planned for 0.1.0.)
@@ -144,7 +144,7 @@ kernel: the cascade is a linear system, so blocks compute their contributions
 in parallel and entry states compose through the host-precomputed `A^L`
 transition — parallel over time as well as channels, matching scipy's float32
 results to ~1e-6 and beating it from one channel (16x) to 256 (109x). Short
-signals use a per-channel-sequential kernel (bit-identical to float32 scipy)
+signals use a per-channel-sequential kernel (bit-identical to modern float32 scipy)
 when there are enough channels, else scipy. `lfilter` with `len(a) > 1`
 (transfer-function form) still falls back to scipy with a `FallbackWarning`;
 use the better-conditioned SOS form, as scipy itself recommends. You will not
@@ -160,7 +160,9 @@ the GPU. Every function routes automatically:
   MLX-array types/dtypes, so the routing is invisible.
 - **`dispatch="mlx"`**: always MLX; calls with no MLX path raise
   `NotImplementedError` instead of falling back (pin the GPU in tests).
-- **`dispatch="scipy"`**: always scipy (correctness reference; still returns MLX arrays).
+- **`dispatch="scipy"`**: scipy numerical kernels (the correctness reference for
+  canonical float32/complex64 operands; still returns MLX arrays). It does not
+  opt back into float64 SOS arithmetic.
 
 ```python
 sig.set_config(dispatch="mlx")                  # global
@@ -174,11 +176,17 @@ detrend) warn loudly; size-based routing is silent by design.
 ## Dtype policy
 
 Metal has no float64, period. Computation is **float32/complex64**. Explicit
-float64/complex128 inputs downcast with a one-time `DowncastWarning`
+float64/complex128 signal and state arrays downcast with a one-time `DowncastWarning`
 (`set_config(float64="strict")` to raise instead; `warn_on_downcast=False` to
 hush). Golden tests hold the fp32 pipeline to `rtol=1e-4` with a peak-relative
 `atol≈1e-5` against float64 scipy references — honest fp32 accuracy, documented
-rather than hidden.
+rather than hidden. SciPy filter-design routines naturally return tiny float64
+SOS coefficient arrays; these canonicalize quietly to float32 by default (strict
+mode rejects them), and a design that becomes unstable or loses a section's
+numerator during quantization raises before filtering. Explicit complex128 or
+extended-precision SOS arrays follow the downcast-warning policy. With scipy
+older than 1.15, scan-unsafe `auto` SOS calls stay on scipy because that
+backend's historical float32 recurrence order differs from the Metal kernel.
 
 ## Known limitations
 
@@ -237,6 +245,6 @@ backend covers every path except the custom Metal kernel (marked `gpu`).
 ## Acknowledgments
 
 - **SciPy** — the API contract and the golden reference. Edge-case semantics were
-  matched against scipy.signal (BSD-3-Clause) and are verified by 399 parity tests.
+  matched against scipy.signal (BSD-3-Clause) and are verified by the parity suite.
 - **MLX** — the lazy, unified-memory array framework that makes the zero-copy
   story possible.
