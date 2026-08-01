@@ -52,6 +52,9 @@ def to_mlx(x) -> mx.array:
     if not isinstance(x, np.ndarray):
         # lists / scalars: let MLX pick its native 32-bit defaults, then normalize
         return to_mlx(mx.array(x))
+    if x.ndim == 0:
+        # mx.array(np 0-d) yields shape (1,); go through a Python scalar
+        return to_mlx(mx.array(x.item()))
     if x.dtype == np.float32 or x.dtype == np.complex64:
         return mx.array(np.ascontiguousarray(x))
     if x.dtype.kind == "f":

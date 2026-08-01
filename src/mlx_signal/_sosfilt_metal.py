@@ -31,8 +31,7 @@ _SRC = """
     int n = params[1];
     if ((int)chan >= B) return;
 
-    const device float* xrow = x + (long)chan * n;
-    device float* yrow = y + (long)chan * n;
+    long row = (long)chan * n;
 
     float b0[{S}], b1[{S}], b2[{S}], a1[{S}], a2[{S}], z1[{S}], z2[{S}];
     for (int s = 0; s < {S}; ++s) {{
@@ -46,14 +45,14 @@ _SRC = """
     }}
 
     for (int t = 0; t < n; ++t) {{
-        float v = xrow[t];
+        float v = x[row + t];
         for (int s = 0; s < {S}; ++s) {{
             float yv = b0[s] * v + z1[s];         // direct form II transposed
             z1[s] = b1[s] * v - a1[s] * yv + z2[s];
             z2[s] = b2[s] * v - a2[s] * yv;
             v = yv;
         }}
-        yrow[t] = v;
+        y[row + t] = v;
     }}
 
     for (int s = 0; s < {S}; ++s) {{
@@ -122,7 +121,7 @@ _P1_SRC = """
     int K = params[2];
     if ((int)blk >= K || (int)chan >= B) return;
 
-    const device float* xrow = x + (long)chan * n;
+    long xoff = (long)chan * n + (long)((int)blk * {L});
     int start = (int)blk * {L};
     int len = min({L}, n - start);
 
@@ -133,15 +132,15 @@ _P1_SRC = """
         z1[s] = 0.0f; z2[s] = 0.0f;
     }}
     for (int t = 0; t < len; ++t) {{
-        float v = xrow[start + t];
+        float v = x[xoff + t];
         for (int s = 0; s < {S}; ++s) {{
 {STEP}
         }}
     }}
-    device float* drow = d + ((long)chan * K + blk) * (2 * {S});
+    long doff = ((long)chan * K + blk) * (2 * {S});
     for (int s = 0; s < {S}; ++s) {{
-        drow[2 * s]     = z1[s];
-        drow[2 * s + 1] = z2[s];
+        d[doff + 2 * s]     = z1[s];
+        d[doff + 2 * s + 1] = z2[s];
     }}
 """
 
@@ -154,13 +153,13 @@ _P2_SRC = """
     float z[2 * {S}];
     for (int i = 0; i < 2 * {S}; ++i) z[i] = zi[(long)chan * 2 * {S} + i];
     for (int k = 0; k < K; ++k) {{
-        device float* zrow = zin + ((long)chan * K + k) * (2 * {S});
-        for (int i = 0; i < 2 * {S}; ++i) zrow[i] = z[i];
+        long zoff = ((long)chan * K + k) * (2 * {S});
+        for (int i = 0; i < 2 * {S}; ++i) zin[zoff + i] = z[i];
         if (k < K - 1) {{
-            const device float* drow = d + ((long)chan * K + k) * (2 * {S});
+            long doff = ((long)chan * K + k) * (2 * {S});
             float zn[2 * {S}];
             for (int r = 0; r < 2 * {S}; ++r) {{
-                float acc = drow[r];
+                float acc = d[doff + r];
                 for (int c = 0; c < 2 * {S}; ++c) acc += AL[r * 2 * {S} + c] * z[c];
                 zn[r] = acc;
             }}
@@ -177,31 +176,30 @@ _P3_SRC = """
     int K = params[2];
     if ((int)blk >= K || (int)chan >= B) return;
 
-    const device float* xrow = x + (long)chan * n;
-    device float* yrow = y + (long)chan * n;
+    long row = (long)chan * n;
     int start = (int)blk * {L};
     int len = min({L}, n - start);
 
     float b0[{S}], b1[{S}], b2[{S}], a1[{S}], a2[{S}], z1[{S}], z2[{S}];
-    const device float* zrow = zin + ((long)chan * K + blk) * (2 * {S});
+    long zoff = ((long)chan * K + blk) * (2 * {S});
     for (int s = 0; s < {S}; ++s) {{
         b0[s] = sos[s * 6 + 0]; b1[s] = sos[s * 6 + 1]; b2[s] = sos[s * 6 + 2];
         a1[s] = sos[s * 6 + 4]; a2[s] = sos[s * 6 + 5];
-        z1[s] = zrow[2 * s];
-        z2[s] = zrow[2 * s + 1];
+        z1[s] = zin[zoff + 2 * s];
+        z2[s] = zin[zoff + 2 * s + 1];
     }}
     for (int t = 0; t < len; ++t) {{
-        float v = xrow[start + t];
+        float v = x[row + start + t];
         for (int s = 0; s < {S}; ++s) {{
 {STEP}
         }}
-        yrow[start + t] = v;
+        y[row + start + t] = v;
     }}
     if ((int)blk == K - 1) {{
-        device float* zfrow = zf + (long)chan * (2 * {S});
+        long zfoff = (long)chan * (2 * {S});
         for (int s = 0; s < {S}; ++s) {{
-            zfrow[2 * s]     = z1[s];
-            zfrow[2 * s + 1] = z2[s];
+            zf[zfoff + 2 * s]     = z1[s];
+            zf[zfoff + 2 * s + 1] = z2[s];
         }}
     }}
 """

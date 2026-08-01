@@ -14,6 +14,8 @@ def next_fast_len(target: int, real: bool = True) -> int:
     accepted for scipy signature compatibility and ignored.
     """
     target = int(target)
+    if target < 0:
+        raise ValueError("Target length must be positive")
     if target <= 1:
-        return 1
+        return target  # scipy: next_fast_len(0) == 0, (1) == 1
     return 1 << (target - 1).bit_length()

@@ -106,7 +106,10 @@ def ifft(a, n=None, axis=-1):
 
 def _any_broken(a, s, axes) -> bool:
     lens = s if s is not None else [a.shape[ax] for ax in (axes or range(a.ndim))]
-    return any(metal_fft_broken(int(x)) for x in lens)
+    # length-1 axes also route to the CPU stream: the Metal n-d path returns
+    # garbage for a length-1 real transform axis (same bug class as the 1-D
+    # wrappers' guards)
+    return any(metal_fft_broken(int(x)) or int(x) == 1 for x in lens)
 
 
 def rfftn(a, s=None, axes=None):

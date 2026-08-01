@@ -24,6 +24,7 @@ import functools
 import mlx.core as mx
 import numpy as np
 
+from ._cache import TWIDDLES
 from ._fft_core import metal_fft_broken
 
 
@@ -65,14 +66,18 @@ def _choose_split(n: int) -> tuple[int, int] | None:
     return best[1], best[2]
 
 
-@functools.lru_cache(maxsize=4)
 def _twiddle(n1: int, n2: int) -> mx.array:
     """TW[j1, k2] = exp(-2*pi*i * j1*k2 / (n1*n2)), phase exact via int64 mod."""
+    key = ("4step", n1, n2)
+    tw = TWIDDLES.get(key)
+    if tw is not None:
+        return tw
     n = n1 * n2
     prod = mx.arange(n1, dtype=mx.int64)[:, None] * mx.arange(n2, dtype=mx.int64)[None, :]
     theta = (prod % n).astype(mx.float32) * mx.array(-2.0 * np.pi / n, dtype=mx.float32)
     tw = mx.cos(theta).astype(mx.complex64) + mx.sin(theta).astype(mx.complex64) * mx.array(1j)
     mx.eval(tw)
+    TWIDDLES.put(key, tw, tw.size * 8)
     return tw
 
 
@@ -110,11 +115,17 @@ def _ifft_4step_last(a: mx.array) -> mx.array:
     return out * mx.array(1.0 / n, dtype=mx.float32)
 
 
-@functools.lru_cache(maxsize=8)
 def _half_twiddle(m: int) -> mx.array:
     """w[k] = exp(-pi*i*k/m) for k in [0, m) — the rfft untangle twiddles."""
-    w = np.exp(-1j * np.pi * np.arange(m) / m).astype(np.complex64)
-    return mx.array(w)
+    key = ("half", m)
+    w = TWIDDLES.get(key)
+    if w is not None:
+        return w
+    theta = mx.arange(m, dtype=mx.float32) * mx.array(-np.pi / m, dtype=mx.float32)
+    w = mx.cos(theta).astype(mx.complex64) + mx.sin(theta).astype(mx.complex64) * mx.array(1j)
+    mx.eval(w)
+    TWIDDLES.put(key, w, w.size * 8)
+    return w
 
 
 def _splittable(n: int) -> bool:
@@ -171,13 +182,17 @@ def rfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     return mx.moveaxis(out, -1, axis) if axis not in (-1, out.ndim - 1) else out
 
 
-@functools.lru_cache(maxsize=8)
 def _pair_coeffs(m: int) -> tuple[mx.array, mx.array]:
     """G coefficients 0.25*(3 - w^2) and 0.25*(1 + w^2), w = exp(-i*pi*k/m)."""
-    w2 = np.exp(-2j * np.pi * np.arange(m) / m).astype(np.complex64)
-    c0 = mx.array((0.25 * (3.0 - w2)).astype(np.complex64))
-    c1 = mx.array((0.25 * (1.0 + w2)).astype(np.complex64))
+    key = ("pair", m)
+    hit = TWIDDLES.get(key)
+    if hit is not None:
+        return hit
+    theta = mx.arange(m, dtype=mx.float32) * mx.array(-2.0 * np.pi / m, dtype=mx.float32)
+    w2 = mx.cos(theta).astype(mx.complex64) + mx.sin(theta).astype(mx.complex64) * mx.array(1j)
+    c0, c1 = 0.25 * (3.0 - w2), 0.25 * (1.0 + w2)
     mx.eval(c0, c1)
+    TWIDDLES.put(key, (c0, c1), 2 * m * 8)
     return c0, c1
 
 
@@ -238,13 +253,17 @@ def rfft_conv_pair(a: mx.array, b: mx.array, n: int, axis: int = -1) -> mx.array
     return mx.moveaxis(out, -1, axis) if axis not in (-1, out.ndim - 1) else out
 
 
-@functools.lru_cache(maxsize=8)
 def _shift_twiddle(m: int, c: int) -> mx.array:
     """t[k] = exp(-2*pi*i*k*c/m), phase reduced mod m in exact int64."""
-    k = np.arange(m, dtype=np.int64)
-    phase = -2.0 * np.pi * ((k * c) % m) / m
-    t = mx.array(np.exp(1j * phase).astype(np.complex64))
+    key = ("shift", m, c)
+    t = TWIDDLES.get(key)
+    if t is not None:
+        return t
+    k = mx.arange(m, dtype=mx.int64)
+    theta = ((k * c) % m).astype(mx.float32) * mx.array(-2.0 * np.pi / m, dtype=mx.float32)
+    t = mx.cos(theta).astype(mx.complex64) + mx.sin(theta).astype(mx.complex64) * mx.array(1j)
     mx.eval(t)
+    TWIDDLES.put(key, t, m * 8)
     return t
 
 

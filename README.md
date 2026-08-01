@@ -30,33 +30,33 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
 |---|---|---:|---:|---:|---:|
-| welch | 64ch × 2^20, nperseg=1024 | 495.0 ms | 8.5 ms | 4.3 ms | **58.5x / 115.0x** |
-| welch | 1ch × 2^22, nperseg=4096 | 49.6 ms | 1.9 ms | 1.3 ms | **25.9x / 39.3x** |
-| welch | 256ch × 2^16, nperseg=256 | 115.0 ms | 4.7 ms | 1.1 ms | **24.3x / 106.1x** |
-| csd | 64ch × 2^20, nperseg=1024 | 936.5 ms | 16.3 ms | 8.2 ms | **57.6x / 114.4x** |
-| coherence | 64ch × 2^20, nperseg=1024 | 1944.9 ms | 17.6 ms | 9.8 ms | **110.5x / 199.2x** |
-| spectrogram | 16ch × 2^20 | 68.7 ms | 6.8 ms | 1.3 ms | **10.1x / 53.7x** |
-| stft | 16ch × 2^20, nperseg=1024 | 81.4 ms | 4.7 ms | 1.3 ms | **17.3x / 63.8x** |
-| istft | 16ch × 2^20, nperseg=1024 | 174.4 ms | 22.9 ms | 3.2 ms | **7.6x / 54.6x** |
-| fftconvolve | 2^20 × 4097 | 10.96 ms | 1.74 ms | 0.53 ms | **6.3x / 20.8x** |
-| fftconvolve | 2^22 × 257 | 46.44 ms | 3.04 ms | 0.72 ms | **15.3x / 64.1x** |
-| fftconvolve (pair) | 2^20 × 2^20 | 21.57 ms | 2.47 ms | 0.92 ms | **8.7x / 23.5x** |
-| oaconvolve | 2^23 × 513 | 27.04 ms | 2.73 ms | 1.32 ms | **9.9x / 20.5x** |
-| correlate (batched) | 64ch × 2^18, 4096 taps | 65.31 ms | 7.08 ms | 4.63 ms | **9.2x / 14.1x** |
-| correlate (auto) | 2^20 autocorrelation | 21.14 ms | 1.92 ms | 0.60 ms | **11.0x / 35.5x** |
-| resample_poly | 16ch, 48k→44.1k (147/160) | 120.7 ms | 6.1 ms | 3.9 ms | **19.7x / 31.0x** |
-| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.6 ms | 7.5 ms | 5.5 ms | **40.4x / 55.2x** |
-| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 182.7 ms | 3.8 ms | 1.3 ms | **47.6x / 145.4x** |
-| resample (FFT) | 2^20 → 2^18 | 4.3 ms | 0.4 ms | 0.3 ms | **11.0x / 14.4x** |
-| hilbert | 2^20 | 9.9 ms | 0.8 ms | 0.6 ms | **12.9x / 17.9x** |
-| lfilter (FIR) | 64ch × 2^20, 257 taps | 1590.45 ms | 12.85 ms | 4.88 ms | **123.8x / 325.9x** |
-| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1306.4 ms | 42.5 ms | 12.0 ms | **30.8x / 109.2x** |
-| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 20.6 ms | 2.0 ms | 1.3 ms | **10.4x / 16.1x** |
-| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2680.6 ms | 125.2 ms | 41.0 ms | **21.4x / 65.4x** |
-| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3259.94 ms | 34.66 ms | 13.52 ms | **94.0x / 241.1x** |
-| resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 66.5 ms | 7.3 ms | 5.5 ms | **9.2x / 12.1x** |
-| hilbert >1M samples¹ | 2^23 | 102.6 ms | 8.1 ms | 6.5 ms | **12.7x / 15.8x** |
-| find_peaks | 2^23, prominence=1 | 218.0 ms | 217.2 ms | — | 1.0x² |
+| welch | 64ch × 2^20, nperseg=1024 | 498.47 ms | 8.14 ms | 4.31 ms | **61.3x / 115.7x** |
+| welch | 1ch × 2^22, nperseg=4096 | 49.41 ms | 2.24 ms | 1.35 ms | **22.0x / 36.6x** |
+| welch | 256ch × 2^16, nperseg=256 | 114.68 ms | 2.76 ms | 1.12 ms | **41.6x / 102.8x** |
+| csd | 64ch × 2^20, nperseg=1024 | 968.02 ms | 16.19 ms | 8.27 ms | **59.8x / 117.1x** |
+| coherence | 64ch × 2^20, nperseg=1024 | 1989.10 ms | 18.01 ms | 9.91 ms | **110.4x / 200.8x** |
+| spectrogram | 16ch × 2^20 | 69.36 ms | 7.01 ms | 1.29 ms | **9.9x / 53.7x** |
+| stft | 16ch × 2^20, nperseg=1024 | 81.33 ms | 4.77 ms | 1.26 ms | **17.1x / 64.7x** |
+| istft | 16ch × 2^20, nperseg=1024 | 179.90 ms | 19.96 ms | 2.38 ms | **9.0x / 75.5x** |
+| fftconvolve | 2^20 × 4097 | 11.29 ms | 1.60 ms | 1.34 ms | **7.0x / 8.4x** |
+| fftconvolve | 2^22 × 257 | 48.68 ms | 3.05 ms | 2.19 ms | **16.0x / 22.2x** |
+| fftconvolve (pair) | 2^20 × 2^20 | 22.07 ms | 2.52 ms | 0.93 ms | **8.8x / 23.7x** |
+| oaconvolve | 2^23 × 513 | 27.03 ms | 2.31 ms | 1.25 ms | **11.7x / 21.6x** |
+| correlate (batched) | 64ch × 2^18, 4096 taps | 66.00 ms | 7.23 ms | 4.82 ms | **9.1x / 13.7x** |
+| correlate (auto) | 2^20 autocorrelation | 22.59 ms | 1.95 ms | 1.58 ms | **11.6x / 14.3x** |
+| resample_poly | 16ch, 48k→44.1k (147/160) | 121.98 ms | 6.27 ms | 3.86 ms | **19.4x / 31.6x** |
+| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 306.78 ms | 7.58 ms | 5.56 ms | **40.5x / 55.1x** |
+| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 184.17 ms | 3.81 ms | 1.24 ms | **48.4x / 148.1x** |
+| resample (FFT) | 2^20 → 2^18 | 4.26 ms | 0.86 ms | 0.47 ms | **5.0x / 9.1x** |
+| hilbert | 2^20 | 10.22 ms | 1.49 ms | 1.33 ms | **6.8x / 7.7x** |
+| lfilter (FIR) | 64ch × 2^20, 257 taps | 1641.91 ms | 13.26 ms | 5.00 ms | **123.8x / 328.5x** |
+| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1322.22 ms | 43.27 ms | 11.94 ms | **30.6x / 110.8x** |
+| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 21.00 ms | 1.71 ms | 1.26 ms | **12.3x / 16.6x** |
+| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2715.50 ms | 127.60 ms | 40.80 ms | **21.3x / 66.6x** |
+| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3281.22 ms | 35.27 ms | 13.91 ms | **93.0x / 235.8x** |
+| resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 69.25 ms | 6.61 ms | 5.68 ms | **10.5x / 12.2x** |
+| hilbert >1M samples¹ | 2^23 | 104.93 ms | 8.24 ms | 6.52 ms | **12.7x / 16.1x** |
+| find_peaks | 2^23, prominence=1 | 224.21 ms | 227.34 ms | — | 1.0x² |
 
 ¹ MLX 0.32's Metal FFT is broken above 2^20 (see *Known limitations*); mlx-signal
 runs those transform lengths through its own four-step (Bailey) decomposition —
@@ -78,11 +78,11 @@ with `pip install -e ".[bench]" && python bench/bench_cross.py`). End-to-end
 
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| welch, 64ch × 2^20 | 485 ms | **9.4 ms** | — | — | 137 ms | — | — |
-| stft, 16ch × 2^20 | 45 ms | **4.2 ms** | 25 ms | 4.4 ms | 44 ms | 64 ms | — |
-| fftconvolve, 2^20 × 4097 | 11 ms | **1.7 ms** | 38 ms | 4.5 ms | 16 ms | — | — |
-| resample 48k→44.1k, 16ch × 2^20 | 123 ms | **6.0 ms**¹ | 8.8 ms¹ | 5.9 ms¹ | — | 57 ms | 54 ms |
-| causal FIR, 64ch × 2^20, 257 taps | 1662 ms | **13 ms** | 2837 ms² | 72 ms² | — | — | — |
+| welch, 64ch × 2^20 | 510 ms | **8.5 ms** | — | — | 137 ms | — | — |
+| stft, 16ch × 2^20 | 47 ms | **4.0 ms** | 25 ms | 4.8 ms | 44 ms | 64 ms | — |
+| fftconvolve, 2^20 × 4097 | 11 ms | **1.6 ms** | 39 ms | 4.4 ms | 16 ms | — | — |
+| resample 48k→44.1k, 16ch × 2^20 | 123 ms | **6.3 ms**¹ | 8.7 ms¹ | 5.7 ms¹ | — | 57 ms | 54 ms |
+| causal FIR, 64ch × 2^20, 257 taps | 1638 ms | **14 ms** | 2933 ms² | 70 ms² | — | — | — |
 
 ¹ Task-level: torchaudio's default anti-aliasing filter (`lowpass_filter_width=6`)
 is far shorter than scipy's/ours (3201 taps here) — mlx-signal matches
@@ -98,9 +98,9 @@ on CPU only; torchaudio has no PSD estimation) — and here `csd`/`coherence` ge
 their own two-signal variant of the fused kernel that computes both spectra and
 the cross spectrum in a single sweep (coherence: one pass instead of scipy's
 five). `upfirdn`/`find_peaks` are scipy-only elsewhere. The closest competitor —
-`torch.stft` on MPS — now trails mlx-signal end-to-end too (4.4 ms vs 4.2 ms)
-and loses badly on-device, where the transform itself runs ~4x faster here
-(0.91 ms vs 3.6 ms); and it ships inside a 2 GB torch dependency with the
+`torch.stft` on MPS — now trails mlx-signal end-to-end too (4.8 ms vs 4.0 ms)
+and loses on-device, where the transform itself runs ~3x faster here
+(0.92 ms vs 2.65 ms); and it ships inside a 2 GB torch dependency with the
 `lfilter` cliff above. The
 speed comes from a fused Metal kernel (`_stft_metal.py`): one threadgroup per
 segment runs strided load → mean-detrend → window → a full radix-2 Stockham FFT
@@ -119,7 +119,7 @@ Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 ```bash
 git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # 333 golden tests against scipy and NumPy
+python -m pytest -q         # 399 golden tests against scipy and NumPy
 ```
 
 (PyPI release planned for 0.1.0.)
@@ -236,6 +236,6 @@ backend covers every path except the custom Metal kernel (marked `gpu`).
 ## Acknowledgments
 
 - **SciPy** — the API contract and the golden reference. Edge-case semantics were
-  matched against scipy.signal (BSD-3-Clause) and are verified by 333 parity tests.
+  matched against scipy.signal (BSD-3-Clause) and are verified by 399 parity tests.
 - **MLX** — the lazy, unified-memory array framework that makes the zero-copy
   story possible.

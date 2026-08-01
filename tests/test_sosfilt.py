@@ -8,6 +8,7 @@ implementation).
 
 import numpy as np
 import pytest
+import scipy
 import scipy.signal as sps
 
 import mlx_signal as msig
@@ -23,9 +24,19 @@ FILTERS = [
 ]
 
 
-# with a GPU the kernel is bit-identical to scipy-in-float32; without Metal the
-# scipy fallback computes in float64, so comparisons loosen accordingly
-_EXACT_RTOL = 1e-6 if HAS_GPU else 1e-4
+# with a GPU the kernel is bit-identical to modern scipy-in-float32; older
+# scipy's float32 recurrence rounds in a different op order (~2e-6 drift), and
+# without Metal the scipy fallback computes in float64 — loosen accordingly
+_SCIPY_VER = tuple(int(p) for p in scipy.__version__.split(".")[:2])
+if not HAS_GPU:
+    _EXACT_RTOL = 1e-4
+elif _SCIPY_VER >= (1, 15):
+    _EXACT_RTOL = 1e-6
+else:
+    _EXACT_RTOL = 1e-5
+
+# renamed from sosfreqz in scipy 1.15
+_freqz_sos = getattr(sps, "freqz_sos", None) or sps.sosfreqz
 
 
 def _f32_ref(sos, x, axis=-1, zi=None):
@@ -106,7 +117,7 @@ def test_sosfilt_impulse_response_matches_freqz(rng):
     x = np.zeros((8, 4096), dtype=np.float32)
     x[:, 0] = 1.0
     h = np.array(msig.sosfilt(sos, x))[0]
-    w, resp = sps.freqz_sos(sos, worN=2048)
+    w, resp = _freqz_sos(sos, worN=2048)
     got = np.fft.rfft(h, 4096)[:2048]
     np.testing.assert_allclose(np.abs(got), np.abs(resp), atol=2e-4)
 
@@ -231,3 +242,65 @@ def test_decimate_iir_zero_phase_false(rng):
     x = rng.standard_normal((10, 8000)).astype(np.float32)
     ref = sps.decimate(x.astype(np.float64), 5, zero_phase=False)
     assert_close(msig.decimate(x, 5, zero_phase=False), ref, rtol=1e-3, atol_frac=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# audit regressions: dtype x section count x block count x pole radius
+# ---------------------------------------------------------------------------
+
+_MATRIX_FILTERS = {
+    "wide-1sec": sps.butter(2, 0.3, output="sos"),
+    "wide-8sec": sps.butter(8, [0.1, 0.3], btype="band", output="sos"),
+    "narrowband": sps.butter(2, 2e-4, output="sos"),  # scan-unsafe: sequential
+}
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+@pytest.mark.parametrize("sos_key", sorted(_MATRIX_FILTERS))
+@pytest.mark.parametrize("n", [3000, 5 * 1024 + 37, 200_000])
+def test_sosfilt_scan_matrix(rng, dtype, sos_key, n):
+    """Every (coefficient dtype, section count, block count, pole radius)
+    combination must track the scipy recurrence — float32 coefficients
+    previously crashed the scan-safety cache, and narrowband poles silently
+    drifted through the block-composed path. 40 channels so auto dispatch
+    engages the kernels (wide filters scan; narrowband goes sequential);
+    without Metal everything runs scipy in float64."""
+    sos = _MATRIX_FILTERS[sos_key].astype(dtype)
+    x = rng.standard_normal((40, n)).astype(np.float32)
+    ref = sps.sosfilt(sos.astype(np.float32) if HAS_GPU else sos.astype(np.float64), x)
+    with msig.config_context(dispatch="auto"):
+        out = np.array(msig.sosfilt(sos, x))
+    tol = 1e-5 if HAS_GPU else 1e-4
+    if sos_key == "narrowband" and _SCIPY_VER < (1, 15):
+        # pre-1.15 scipy's float32 recurrence rounds in a different op order;
+        # this filter's conditioning amplifies that to ~1e-2 relative-to-max
+        # (still far below the 16% drift this test guards against)
+        tol = 1e-2
+    np.testing.assert_allclose(out, ref, rtol=tol,
+                               atol=tol * max(np.abs(ref).max(), 1e-9))
+
+
+def test_sosfilt_scan_small_launches(rng):
+    """1 section x 1 channel at 2048-3072 samples previously failed Metal
+    compilation (tiny scan intermediates land in constant address space)."""
+    if not HAS_GPU:
+        pytest.skip("scan kernel needs Metal")
+    sos = sps.butter(2, 0.3, output="sos")
+    for n in (2048, 2560, 3072):
+        x = rng.standard_normal(n).astype(np.float32)
+        ref = _f32_ref(sos, x)
+        out = np.array(msig.sosfilt(sos, x))
+        np.testing.assert_allclose(out, ref, rtol=1e-5,
+                                   atol=1e-5 * np.abs(ref).max())
+
+
+def test_sosfiltfilt_narrowband_zi_matches_executed_filter():
+    """zi must describe the float32-rounded filter the kernel executes; the
+    f64-designed zi started narrowband cascades visibly wrong (0.298 error)."""
+    sos = sps.butter(2, 1e-4, output="sos")
+    x = np.ones(60_000, np.float32)
+    # the f32-rounded coefficients form a genuinely different filter (DC-gain
+    # cancellation): compare against whichever filter this build executes
+    ref = sps.sosfiltfilt(sos.astype(np.float32) if HAS_GPU else sos, x)
+    out = np.array(msig.sosfiltfilt(sos, x))
+    assert np.abs(out - ref).max() < 0.02

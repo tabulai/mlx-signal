@@ -100,6 +100,18 @@ def resample(x, num, t=None, axis=0, window=None, domain="time"):
             fac = np.ones(m2, dtype=np.float32)
             fac[m // 2] = 2.0 if num < n_x else 0.5
             X = X * mx.array(fac)
+        if W is not None and np.iscomplexobj(W):
+            # np.irfft ignores the imaginary parts of the DC (and, for even
+            # output lengths, Nyquist) bins; MLX's does not — drop them
+            # explicitly so a complex window matches scipy
+            head = mx.real(X[..., :1]).astype(mx.complex64)
+            if num % 2 == 0 and X.shape[-1] == num // 2 + 1:
+                X = mx.concatenate(
+                    [head, X[..., 1:-1], mx.real(X[..., -1:]).astype(mx.complex64)],
+                    axis=-1,
+                )
+            else:
+                X = mx.concatenate([head, X[..., 1:]], axis=-1)
         x_r = _sfft.irfft(X * mx.array(1.0 / s_fac, dtype=mx.float32), n=num, axis=-1)
     else:
         if domain == "time":

@@ -234,6 +234,9 @@ _SOSFILT_MIN_ROWS = 32
 
 def _validate_sos_np(sos) -> np.ndarray:
     sos = np.atleast_2d(np.asarray(to_numpy(sos)))
+    # canonical coefficient dtype: everything downstream (the scan-safety
+    # cache key, A^L precompute, scipy fallbacks) assumes 8-byte scalars
+    sos = sos.astype(np.complex128 if np.iscomplexobj(sos) else np.float64)
     if sos.ndim != 2:
         raise ValueError("sos array must be 2D")
     if sos.shape[1] != 6:
@@ -247,13 +250,19 @@ def _validate_sos_np(sos) -> np.ndarray:
 
 @_functools.lru_cache(maxsize=64)
 def _scan_safe(sos_bytes: bytes, n_sections: int) -> bool:
-    """Block-composed state propagation loses float32 accuracy when poles sit
-    essentially on the unit circle (very narrowband filters); those stay on the
+    """Scan-dispatch gate: every section's impulse response must decay to
+    (near) nothing within one scan block.
+
+    The block scan composes per-block A^L transitions in float32; when a
+    pole's response outlives a block (radius**L not small), those compositions
+    round differently from the sequential recurrence and the output can drift
+    by percents — a radius-only near-unit-circle check misses this (e.g.
+    butter(2, 2e-4): radius 0.99956, 16% L2 drift). Such filters stay on the
     exact per-channel-sequential kernel."""
     sos = np.frombuffer(sos_bytes, dtype=np.float64).reshape(n_sections, 6)
-    for a1, a2 in sos[:, 4:6]:
+    for a1, a2 in sos[:, 4:6].real:
         radius = np.max(np.abs(np.roots([1.0, a1, a2]))) if (a1 or a2) else 0.0
-        if radius > 1.0 - 1e-4:
+        if radius >= 1.0 or radius**_SCAN_BLOCK_REF > 1e-2:
             return False
     return True
 
@@ -438,7 +447,14 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
 
     from scipy.signal import sosfilt_zi as _sosfilt_zi
 
-    zi_np = np.asarray(_sosfilt_zi(sos_np), dtype=np.float64)  # (S, 2)
+    from . import _sosfilt_metal
+
+    # the GPU kernel runs float32-rounded coefficients; the steady-state zi
+    # must describe THAT filter, or narrowband cascades start visibly wrong
+    sos_zi = sos_np
+    if mx.metal.is_available() and n_sections <= _sosfilt_metal.MAX_SECTIONS:
+        sos_zi = sos_np.astype(np.float32).astype(np.float64)
+    zi_np = np.asarray(_sosfilt_zi(sos_zi), dtype=np.float64)  # (S, 2)
     zi_shape = [1] * ext.ndim
     zi_shape[-1] = 2
     zi = mx.array(zi_np.astype(np.float32)).reshape([n_sections] + zi_shape)

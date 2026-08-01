@@ -32,3 +32,16 @@ jobs:
       # exercise the no-Metal code paths explicitly (auto dispatch + scipy
       # fallback for kernel-only capabilities), even if the runner has a GPU
       - run: MLX_SIGNAL_SIMULATE_NO_METAL=1 python -m pytest -q
+
+  # the oldest dependency stack pyproject.toml claims to support
+  test-floor:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "scipy==1.11.*" "numpy==1.24.*" "mlx==0.30.*" "pytest>=8"
+      - run: pip install -e . --no-deps
+      - run: python -m pytest -q
+      - run: MLX_SIGNAL_SIMULATE_NO_METAL=1 python -m pytest -q

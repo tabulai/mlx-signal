@@ -9,7 +9,6 @@ cliff the way raw non-power-of-two FFTs do.
 
 from __future__ import annotations
 
-import functools
 import math
 
 import mlx.core as mx
@@ -18,6 +17,7 @@ import numpy as np
 from . import _fft_core as _sfft
 from . import _fourstep, _ola_metal, _stft_metal
 from ._array import result_to_mlx, signal_np, to_mlx
+from ._cache import TWIDDLES
 from ._config import use_mlx
 from ._fft import next_fast_len
 
@@ -382,16 +382,28 @@ def correlate(in1, in2, mode="full", method="auto"):
     return fftconvolve(a1, _reverse_and_conj(a2), mode=mode)
 
 
-@functools.lru_cache(maxsize=64)
 def _rev_twiddle(fl: int, length: int, half: bool) -> mx.array:
     """Linear phase relating a reversed signal's spectrum to conj(X).
 
     FFT(rev(conj(x)), fl)[k] = exp(-2j*pi*k*(length-1)/fl) * conj(X[k]); the
     phase is reduced mod fl in exact int64 before the complex exponential.
+    Cached under a byte budget: per-(fl, length) vectors under an entry-count
+    LRU once retained hundreds of MiB across autocorrelation lengths.
     """
-    k = np.arange(fl // 2 + 1 if half else fl, dtype=np.int64)
-    phase = -2.0 * np.pi * ((k * (length - 1)) % fl) / fl
-    return mx.array(np.exp(1j * phase).astype(np.complex64))
+    key = ("rev", fl, length, half)
+    t = TWIDDLES.get(key)
+    if t is not None:
+        return t
+    k = mx.arange(fl // 2 + 1 if half else fl, dtype=mx.int64)
+    theta = ((k * (length - 1)) % fl).astype(mx.float32) * mx.array(
+        -2.0 * np.pi / fl, dtype=mx.float32
+    )
+    t = mx.cos(theta).astype(mx.complex64) + mx.sin(theta).astype(
+        mx.complex64
+    ) * mx.array(1j)
+    mx.eval(t)
+    TWIDDLES.put(key, t, t.size * 8)
+    return t
 
 
 def _autocorrelate(x: mx.array, orig, mode: str) -> mx.array:

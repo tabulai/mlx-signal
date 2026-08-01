@@ -285,3 +285,63 @@ def test_float64_strict_raises_on_scipy_path(rng):
     with msig.config_context(dispatch="scipy", float64="strict"):
         with pytest.raises(TypeError, match="strict"):
             msig.fftconvolve(x, h)
+
+
+# ---------------------------------------------------------------------------
+# second audit round: windows, 0-d, FFT edge parity
+# ---------------------------------------------------------------------------
+
+
+def test_resample_complex_window_dc_nyquist(rng):
+    """np.irfft drops the imaginary parts of the DC/Nyquist bins; the MLX
+    path must do so explicitly or a complex window diverges completely."""
+    x = np.ones(19, np.float32)
+    w = np.full(19, 1j, np.complex64)
+    ref = sps.resample(x, 47, window=w)
+    out = np.array(msig.resample(x, 47, window=w))
+    np.testing.assert_allclose(out, ref, atol=1e-5)
+    x2 = rng.standard_normal(100).astype(np.float32)
+    w2 = np.exp(1j * np.linspace(0, 1, 100))
+    for num in (64, 63):  # even output exercises the Nyquist-bin branch
+        np.testing.assert_allclose(
+            np.array(msig.resample(x2, num, window=w2)),
+            sps.resample(x2, num, window=w2), atol=1e-5,
+        )
+
+
+def test_zero_dim_inputs():
+    from mlx_signal._array import to_mlx
+
+    assert to_mlx(np.float32(3.0)).shape == ()
+    assert to_mlx(np.array(2.0)).shape == ()
+    out = msig.fftconvolve(np.float32(2.0), np.float32(3.0))
+    ref = sps.fftconvolve(np.float32(2.0), np.float32(3.0))
+    assert np.array(out).shape == ref.shape
+    np.testing.assert_allclose(np.array(out), ref)
+
+
+def test_next_fast_len_edge_parity():
+    import scipy.fft
+
+    assert msig.next_fast_len(0) == scipy.fft.next_fast_len(0) == 0
+    assert msig.next_fast_len(1) == scipy.fft.next_fast_len(1) == 1
+    with pytest.raises(ValueError):
+        msig.next_fast_len(-1)
+
+
+def test_nd_fft_length_one_axis(rng):
+    """The Metal n-d real FFT returns garbage for a length-1 transform axis;
+    the wrappers must route those to the CPU stream."""
+    from mlx_signal import _fft_core
+
+    x = mx.array(rng.standard_normal((4, 1)).astype(np.float32))
+    np.testing.assert_allclose(
+        np.array(_fft_core.rfftn(x, s=[1], axes=[-1])),
+        np.fft.rfftn(np.array(x), s=[1], axes=[-1]), atol=1e-6,
+    )
+    sp = _fft_core.rfftn(x, s=[1], axes=[-1])
+    np.testing.assert_allclose(
+        np.array(_fft_core.irfftn(sp, s=[1], axes=[-1])),
+        np.fft.irfftn(np.fft.rfftn(np.array(x), s=[1], axes=[-1]), s=[1], axes=[-1]),
+        atol=1e-6,
+    )
