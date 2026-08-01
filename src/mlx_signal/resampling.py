@@ -174,27 +174,8 @@ def _upfirdn_composed(x2: mx.array, h: mx.array, up: int, down: int) -> mx.array
 
 def _upfirdn_plane_dispatch(x2: mx.array, h: mx.array, up: int, down: int,
                             n_out: int) -> mx.array:
-    """Split complex signals/filters into float32 kernel launches (conv is linear)."""
-    cx = x2.dtype == mx.complex64
-    ch = h.dtype == mx.complex64
-    j = mx.array(1j)
-    if not cx and not ch:
-        return upfirdn_gpu(x2, h, up, down, n_out)
-    if cx and not ch:
-        re = upfirdn_gpu(mx.real(x2), h, up, down, n_out)
-        im = upfirdn_gpu(mx.imag(x2), h, up, down, n_out)
-        return re.astype(mx.complex64) + im.astype(mx.complex64) * j
-    if ch and not cx:
-        re = upfirdn_gpu(x2, mx.real(h), up, down, n_out)
-        im = upfirdn_gpu(x2, mx.imag(h), up, down, n_out)
-        return re.astype(mx.complex64) + im.astype(mx.complex64) * j
-    xr, xi = mx.real(x2), mx.imag(x2)
-    hr, hi = mx.real(h), mx.imag(h)
-    rr = upfirdn_gpu(xr, hr, up, down, n_out)
-    ii = upfirdn_gpu(xi, hi, up, down, n_out)
-    ri = upfirdn_gpu(xr, hi, up, down, n_out)
-    ir = upfirdn_gpu(xi, hr, up, down, n_out)
-    return (rr - ii).astype(mx.complex64) + (ri + ir).astype(mx.complex64) * j
+    """One kernel launch for every real/complex combination (dtype-templated)."""
+    return upfirdn_gpu(x2, h, up, down, n_out)
 
 
 def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):

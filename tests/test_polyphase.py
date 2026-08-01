@@ -184,3 +184,20 @@ def test_decimate_dlti_falls_back(rng):
     assert_close(out, sps.decimate(x, 4, ftype=system), rtol=1e-3, atol_frac=1e-4)
     with pytest.raises(NotImplementedError):
         msig.decimate(x, 4, ftype=system)  # dispatch="mlx" pinned by fixture
+
+
+@pytest.mark.parametrize("n,up,down,n_taps", [(2000, 3, 2, 6000), (1500, 2, 5, 4097)])
+def test_upfirdn_multi_tile_taps(rng, n, up, down, n_taps):
+    """Filters longer than one threadgroup tile stream through multiple tiles."""
+    x = rng.standard_normal(n).astype(np.float32)
+    h = rng.standard_normal(n_taps).astype(np.float32)
+    assert_close(msig.upfirdn(h, x, up, down), sps.upfirdn(h, x, up, down),
+                 rtol=2e-4, atol_frac=2e-5)
+
+
+def test_upfirdn_complex_multi_tile(rng):
+    """Complex taps use half-size tiles; 3000 taps spans three of them."""
+    x = (rng.standard_normal(1200) + 1j * rng.standard_normal(1200)).astype(np.complex64)
+    h = (rng.standard_normal(3000) + 1j * rng.standard_normal(3000)).astype(np.complex64)
+    assert_close(msig.upfirdn(h, x, 2, 3), sps.upfirdn(h, x, 2, 3),
+                 rtol=2e-4, atol_frac=2e-5)

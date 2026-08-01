@@ -146,6 +146,16 @@ def build_cases(quick: bool) -> list[Case]:
         (x, h),
     ))
 
+    iq = (rng.standard_normal((16, 1 << 20))
+          + 1j * rng.standard_normal((16, 1 << 20))).astype(np.complex64)
+    hlp = np.asarray(sps.firwin(201, 0.08), dtype=np.float32)
+    cases.append(Case(
+        "upfirdn (complex IQ)", "16ch x 2^20 c64, down=10, 201 taps",
+        lambda iq=iq, h=hlp: sps.upfirdn(h, iq, 1, 10, axis=-1),
+        lambda iq=iq, h=hlp: msig.upfirdn(h, iq, 1, 10, axis=-1),
+        (iq, hlp),
+    ))
+
     x = sig(1 << 20)
     cases.append(Case(
         "resample (FFT)", "2^20 -> 2^18",
@@ -306,6 +316,8 @@ def _device_variant(case: Case, mx_inputs):
         return lambda: msig.resample_poly(a[0], 147, 160, axis=-1)
     if n == "upfirdn":
         return lambda: msig.upfirdn(a[1], a[0], 2, 3, axis=-1)
+    if n == "upfirdn (complex IQ)":
+        return lambda: msig.upfirdn(a[1], a[0], 1, 10, axis=-1)
     if n == "resample (FFT)":
         return lambda: msig.resample(a[0], a[0].size // 4)
     if n.startswith("resample (FFT, >1M"):

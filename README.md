@@ -42,8 +42,9 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 | fftconvolve | 2^22 × 257 | 47.8 ms | 2.9 ms | 1.7 ms | **16.3x / 27.7x** |
 | oaconvolve | 2^23 × 513 | 27.4 ms | 4.0 ms | 2.7 ms | **6.8x / 10.4x** |
 | correlate (batched) | 64ch × 2^18, 4096 taps | 65.2 ms | 8.4 ms | 6.1 ms | **7.8x / 10.7x** |
-| resample_poly | 16ch, 48k→44.1k (147/160) | 120.3 ms | 6.4 ms | 4.2 ms | **18.8x / 28.3x** |
-| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 303.7 ms | 8.9 ms | 7.0 ms | **34.0x / 43.6x** |
+| resample_poly | 16ch, 48k→44.1k (147/160) | 120.7 ms | 6.1 ms | 3.9 ms | **19.7x / 31.0x** |
+| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.6 ms | 7.5 ms | 5.5 ms | **40.4x / 55.2x** |
+| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 182.7 ms | 3.8 ms | 1.3 ms | **47.6x / 145.4x** |
 | resample (FFT) | 2^20 → 2^18 | 4.3 ms | 0.4 ms | 0.3 ms | **11.0x / 14.4x** |
 | hilbert | 2^20 | 9.9 ms | 0.8 ms | 0.6 ms | **12.9x / 17.9x** |
 | lfilter (FIR) | 64ch × 2^20, 257 taps | 1634.7 ms | 17.7 ms | 9.8 ms | **92.1x / 167.7x** |
@@ -115,7 +116,7 @@ Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
 ```bash
 git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
 pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # 329 golden tests against scipy and NumPy
+python -m pytest -q         # 333 golden tests against scipy and NumPy
 ```
 
 (PyPI release planned for 0.1.0.)
@@ -126,7 +127,7 @@ python -m pytest -q         # 329 golden tests against scipy and NumPy
 |---|---|---|
 | spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernels on the pow2 hot path (two-signal csd/coherence variant, inverse+gather-OLA for istft), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; FFT lengths padded to powers of two |
-| resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn` (one thread per output sample, taps staged in threadgroup memory) |
+| resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, taps tiled through threadgroup memory (or read direct at high `up`), complex-native — an IQ stream is one launch |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR and SOS-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up) with scipy-exact edge handling; design host-side |
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
 | utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
@@ -207,7 +208,7 @@ rather than hidden.
 
 - [`examples/fm_demod.py`](examples/fm_demod.py) — the classic cuSignal FM
   demodulation chain (channel filter → polyphase decimate → discriminator →
-  de-emphasis → audio resample), 12.1x end-to-end vs scipy on an M4 Max, with
+  de-emphasis → audio resample), 16.5x end-to-end vs scipy on an M4 Max, with
   0.999 correlation to the true message.
 - [`examples/eeg_bandpower.py`](examples/eeg_bandpower.py) — 64-channel × 10-minute
   EEG alpha-band power via one batched `welch`, 6x vs scipy including result
