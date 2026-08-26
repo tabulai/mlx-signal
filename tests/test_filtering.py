@@ -7,6 +7,7 @@ import scipy.signal as sps
 import mlx_signal as msig
 from _utils import assert_close, assert_type_and_dtype
 from conftest import HAS_GPU
+from mlx_signal.filtering import _scipy_lfilter_f32_order_matches_metal
 
 
 def test_firwin_matches_scipy():
@@ -189,8 +190,6 @@ def test_filtfilt_zero_phase_property(rng):
 # bit-identical; without Metal the fallback runs scipy on the same canonical
 # f32 inputs, which is exact by construction.
 
-from mlx_signal.filtering import _scipy_lfilter_f32_order_matches_metal
-
 _TF_EXACT = (not HAS_GPU) or _scipy_lfilter_f32_order_matches_metal()
 
 _TF_FILTERS = [
@@ -295,7 +294,7 @@ def test_lfilter_tf_scan_engages_and_drift_stays_bounded(rng, monkeypatch):
     ~1e-5 drift bound."""
     import mlx.core as mx
 
-    from mlx_signal import _lfilter_metal, filtering
+    from mlx_signal import _lfilter_metal
 
     if not mx.metal.is_available():
         pytest.skip("scan kernel needs Metal")
