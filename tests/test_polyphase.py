@@ -84,6 +84,81 @@ def test_kernel_agrees_with_composed_path(rng, n, up, down, n_taps):
     assert_close(a, np.array(b))
 
 
+@requires_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("cx,ch", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("n,up,down,n_taps", [
+    (1000, 3, 2, 65), (300, 160, 147, 3201), (2000, 1, 10, 201), (1500, 2, 5, 4097),
+])
+def test_u32_route_bit_identical(rng, cx, ch, n, up, down, n_taps):
+    """Dispatch between the u32 and long-arithmetic kernels is a pure
+    performance choice: all routes accumulate in the same order, so outputs
+    must be bit-identical, not merely close."""
+    import mlx.core as mx
+
+    from mlx_signal import _upfirdn_metal as um
+    from mlx_signal.resampling import _output_len
+
+    x = rng.standard_normal((3, n)).astype(np.float32)
+    if cx:
+        x = (x + 1j * rng.standard_normal((3, n))).astype(np.complex64)
+    h = rng.standard_normal(n_taps).astype(np.float32)
+    if ch:
+        h = (h + 1j * rng.standard_normal(n_taps)).astype(np.complex64)
+    x, h = mx.array(x), mx.array(h)
+    n_out = _output_len(n_taps, n, up, down)
+    complex_out = cx or ch
+    xin = mx.view(x, mx.float32) if cx else x
+    hin = mx.view(h, mx.float32) if ch else h
+    params = mx.array([n, n_out, up, down, n_taps], dtype=mx.int32)
+    width = 2 * n_out if complex_out else n_out
+
+    def launch(kern):
+        (out,) = kern(inputs=[xin, hin, params], grid=(n_out, 3, 1),
+                      threadgroup=(min(256, max(32, n_out)), 1, 1),
+                      output_shapes=[(3, width)], output_dtypes=[mx.float32])
+        return np.array(out)
+
+    ref = launch(um._kernel(cx, ch, direct=True, u32=True))
+    np.testing.assert_array_equal(ref, launch(um._kernel(cx, ch, direct=False)))
+    np.testing.assert_array_equal(ref, launch(um._kernel(cx, ch, direct=True)))
+
+
+def test_u32_guard_accounts_for_float2_factors():
+    """The u32 overflow guard must include the float32-view doubling: complex
+    input doubles the flat x index, complex output doubles the store offset.
+    A miss here is silent wrong output, so pin each term's boundary."""
+    from mlx_signal._upfirdn_metal import _U32_LIMIT, _fits_u32
+
+    assert _U32_LIMIT == 1 << 31
+    # input side: B * n_in * (2 if complex signal)
+    assert _fits_u32(2, 1 << 29, 1 << 20, 1, 1, cx=False, complex_out=False)
+    assert not _fits_u32(2, 1 << 29, 1 << 20, 1, 1, cx=True, complex_out=True)
+    # output side: B * n_out * (2 if complex signal OR complex taps)
+    assert _fits_u32(2, 1 << 20, 1 << 29, 1, 1, cx=False, complex_out=False)
+    assert not _fits_u32(2, 1 << 20, 1 << 29, 1, 1, cx=False, complex_out=True)
+    # geometry: n_out * down + 2 * up covers m = i*down plus the loop overshoot
+    assert not _fits_u32(1, 1 << 20, 1 << 30, 1, 2, cx=False, complex_out=False)
+    assert _fits_u32(1, 1 << 20, 1 << 29, 1, 2, cx=False, complex_out=False)
+    # ... and the overshoot term alone: only 2*up trips these
+    assert not _fits_u32(1, 4, 1, 1 << 30, 1, cx=False, complex_out=False)
+    assert _fits_u32(1, 4, 1, 1 << 29, 1, cx=False, complex_out=False)
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_upfirdn_gpu_empty_taps_stores_zeros():
+    """Internal contract: zero-length taps (unreachable through the public
+    upfirdn(), which validates h) must empty the tap window and store exact
+    zeros on the u32 route just like the long kernels — never read h."""
+    import mlx.core as mx
+
+    from mlx_signal._upfirdn_metal import upfirdn_gpu
+
+    out = upfirdn_gpu(mx.ones((2, 100)), mx.zeros((0,)), 2, 1, 199)
+    np.testing.assert_array_equal(np.array(out), np.zeros((2, 199), np.float32))
+
+
 def test_upfirdn_pad_mode_falls_back(rng):
     x = rng.standard_normal(300).astype(np.float32)
     h = rng.standard_normal(21).astype(np.float32)
