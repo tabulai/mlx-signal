@@ -267,6 +267,28 @@ def build_cases(quick: bool) -> list[Case]:
         lambda x=x, s_=sos_iir: msig.sosfiltfilt(s_, x, axis=-1),
         (x,),
     ))
+    b_tf, a_tf = (np.asarray(c, dtype=np.float64) for c in sps.butter(4, 0.25))
+    cases.append(Case(
+        "lfilter (IIR)", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, butter-4 tf",
+        lambda x=x, b=b_tf, a=a_tf: sps.lfilter(
+            b.astype(np.float32), a.astype(np.float32), x, axis=-1),
+        lambda x=x, b=b_tf, a=a_tf: msig.lfilter(b, a, x, axis=-1),
+        (x,),
+    ))
+    cases.append(Case(
+        "lfilter (IIR, 1ch scan)", "1ch x 2^22, butter-4 tf",
+        lambda x=x1, b=b_tf, a=a_tf: sps.lfilter(
+            b.astype(np.float32), a.astype(np.float32), x, axis=-1),
+        lambda x=x1, b=b_tf, a=a_tf: msig.lfilter(b, a, x, axis=-1),
+        (x1,),
+    ))
+    cases.append(Case(
+        "filtfilt (IIR)", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, butter-4 tf",
+        lambda x=x, b=b_tf, a=a_tf: sps.filtfilt(
+            b.astype(np.float32), a.astype(np.float32), x, axis=-1),
+        lambda x=x, b=b_tf, a=a_tf: msig.filtfilt(b, a, x, axis=-1),
+        (x,),
+    ))
 
     # --- peaks (honesty check: expected ~1x) --------------------------------
     x = sig(1 << 23) if not quick else sig(1 << 20)
@@ -372,6 +394,16 @@ def _device_variant(case: Case, mx_inputs):
 
         sos_iir = _sps.butter(8, 0.2, output="sos")
         return lambda: msig.sosfiltfilt(sos_iir, a[0], axis=-1)
+    if n in ("lfilter (IIR)", "lfilter (IIR, 1ch scan)"):
+        import scipy.signal as _sps
+
+        b_tf, a_tf = _sps.butter(4, 0.25)
+        return lambda: msig.lfilter(b_tf, a_tf, a[0], axis=-1)
+    if n == "filtfilt (IIR)":
+        import scipy.signal as _sps
+
+        b_tf, a_tf = _sps.butter(4, 0.25)
+        return lambda: msig.filtfilt(b_tf, a_tf, a[0], axis=-1)
     if n == "find_peaks":
         return None  # host-side by design
     return None

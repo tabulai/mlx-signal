@@ -2,30 +2,33 @@ Benchmarks on Apple M4 Max (macOS 26.2), mlx 0.32.0, scipy 1.18.0, float32 input
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
 |---|---|---:|---:|---:|---:|
-| welch | 64ch x 2^20, nperseg=1024 | 491.59 ms | 8.45 ms | 4.29 ms | 58.2x / 114.5x |
-| welch | 1ch x 2^22, nperseg=4096 | 48.91 ms | 1.79 ms | 1.23 ms | 27.4x / 39.7x |
-| welch | 256ch x 2^16, nperseg=256 | 113.80 ms | 2.09 ms | 1.10 ms | 54.5x / 103.1x |
-| spectrogram | 16ch x 2^20 | 67.25 ms | 3.56 ms | 1.32 ms | 18.9x / 51.0x |
-| stft | 16ch x 2^20, nperseg=1024 | 80.38 ms | 4.76 ms | 1.23 ms | 16.9x / 65.3x |
-| fftconvolve | 2^20 x 4097 | 11.17 ms | 1.65 ms | 0.92 ms | 6.8x / 12.2x |
-| fftconvolve | 2^22 x 257 | 48.09 ms | 2.74 ms | 0.73 ms | 17.6x / 65.8x |
-| fftconvolve (pair) | 2^20 x 2^20 | 21.58 ms | 2.52 ms | 0.96 ms | 8.6x / 22.5x |
-| correlate (auto) | 2^20 autocorrelation | 22.06 ms | 2.04 ms | 1.56 ms | 10.8x / 14.1x |
-| oaconvolve | 2^23 x 513 | 27.10 ms | 2.69 ms | 1.24 ms | 10.1x / 21.9x |
-| correlate (batched) | 64ch x 2^18, 4096 taps | 65.07 ms | 7.30 ms | 4.85 ms | 8.9x / 13.4x |
-| resample_poly | 16ch, 48k->44.1k (147/160) | 122.08 ms | 4.33 ms | 0.99 ms | 28.2x / 122.7x |
-| upfirdn | 64ch x 2^18, up=2 down=3, 255 taps | 300.57 ms | 4.34 ms | 2.29 ms | 69.2x / 131.0x |
-| upfirdn (complex IQ) | 16ch x 2^20 c64, down=10, 201 taps | 183.14 ms | 4.48 ms | 1.26 ms | 40.8x / 145.8x |
-| resample (FFT) | 2^20 -> 2^18 | 4.27 ms | 1.00 ms | 0.80 ms | 4.3x / 5.3x |
-| hilbert | 2^20 | 9.33 ms | 2.01 ms | 1.31 ms | 4.7x / 7.1x |
-| resample (FFT, >1M) | 2^23 -> x0.75 | 67.19 ms | 6.53 ms | 5.63 ms | 10.3x / 11.9x |
-| hilbert (>1M) | 2^23 | 103.13 ms | 8.45 ms | 6.44 ms | 12.2x / 16.0x |
-| lfilter (FIR) | 64ch x 2^20, 257 taps | 1648.79 ms | 13.06 ms | 5.08 ms | 126.2x / 324.9x |
-| filtfilt (FIR) | 64ch x 2^20, 257 taps | 3253.45 ms | 34.83 ms | 13.73 ms | 93.4x / 237.0x |
-| istft | 16ch x 2^20, nperseg=1024 | 178.74 ms | 19.48 ms | 1.96 ms | 9.2x / 91.2x |
-| csd | 64ch x 2^20, nperseg=1024 | 937.92 ms | 15.98 ms | 8.16 ms | 58.7x / 115.0x |
-| coherence | 64ch x 2^20, nperseg=1024 | 1939.59 ms | 17.44 ms | 9.74 ms | 111.2x / 199.0x |
-| sosfilt (IIR) | 256ch x 2^20, butter-8 | 1307.77 ms | 42.82 ms | 12.08 ms | 30.5x / 108.2x |
-| sosfilt (IIR, 1ch scan) | 1ch x 2^22, butter-8 | 20.57 ms | 1.81 ms | 1.35 ms | 11.3x / 15.3x |
-| sosfiltfilt (IIR) | 256ch x 2^20, butter-8 | 2688.07 ms | 126.66 ms | 40.95 ms | 21.2x / 65.6x |
-| find_peaks | 2^23, prominence=1 | 221.94 ms | 221.29 ms | — | 1.0x / — |
+| welch | 64ch x 2^20, nperseg=1024 | 493.73 ms | 9.69 ms | 4.36 ms | 50.9x / 113.3x |
+| welch | 1ch x 2^22, nperseg=4096 | 48.08 ms | 2.01 ms | 0.61 ms | 23.9x / 79.4x |
+| welch | 256ch x 2^16, nperseg=256 | 111.13 ms | 2.53 ms | 1.06 ms | 44.0x / 105.2x |
+| spectrogram | 16ch x 2^20 | 66.81 ms | 3.57 ms | 1.25 ms | 18.7x / 53.6x |
+| stft | 16ch x 2^20, nperseg=1024 | 79.78 ms | 4.75 ms | 1.22 ms | 16.8x / 65.2x |
+| fftconvolve | 2^20 x 4097 | 10.93 ms | 1.61 ms | 1.40 ms | 6.8x / 7.8x |
+| fftconvolve | 2^22 x 257 | 44.87 ms | 2.65 ms | 0.70 ms | 17.0x / 64.0x |
+| fftconvolve (pair) | 2^20 x 2^20 | 20.13 ms | 2.63 ms | 0.94 ms | 7.7x / 21.5x |
+| correlate (auto) | 2^20 autocorrelation | 20.26 ms | 1.96 ms | 0.60 ms | 10.3x / 33.8x |
+| oaconvolve | 2^23 x 513 | 27.19 ms | 3.26 ms | 1.25 ms | 8.3x / 21.7x |
+| correlate (batched) | 64ch x 2^18, 4096 taps | 63.66 ms | 6.99 ms | 4.59 ms | 9.1x / 13.9x |
+| resample_poly | 16ch, 48k->44.1k (147/160) | 120.29 ms | 3.36 ms | 0.96 ms | 35.8x / 125.8x |
+| upfirdn | 64ch x 2^18, up=2 down=3, 255 taps | 295.15 ms | 4.34 ms | 2.30 ms | 68.0x / 128.3x |
+| upfirdn (complex IQ) | 16ch x 2^20 c64, down=10, 201 taps | 180.69 ms | 3.80 ms | 1.25 ms | 47.5x / 144.2x |
+| resample (FFT) | 2^20 -> 2^18 | 4.25 ms | 0.55 ms | 0.35 ms | 7.7x / 12.1x |
+| hilbert | 2^20 | 9.89 ms | 1.10 ms | 0.81 ms | 9.0x / 12.2x |
+| resample (FFT, >1M) | 2^23 -> x0.75 | 66.45 ms | 6.44 ms | 5.61 ms | 10.3x / 11.8x |
+| hilbert (>1M) | 2^23 | 102.26 ms | 8.57 ms | 6.43 ms | 11.9x / 15.9x |
+| lfilter (FIR) | 64ch x 2^20, 257 taps | 1619.76 ms | 12.93 ms | 4.88 ms | 125.2x / 332.1x |
+| filtfilt (FIR) | 64ch x 2^20, 257 taps | 3236.10 ms | 35.12 ms | 13.74 ms | 92.1x / 235.6x |
+| istft | 16ch x 2^20, nperseg=1024 | 178.28 ms | 21.19 ms | 2.63 ms | 8.4x / 67.9x |
+| csd | 64ch x 2^20, nperseg=1024 | 936.84 ms | 16.53 ms | 8.28 ms | 56.7x / 113.1x |
+| coherence | 64ch x 2^20, nperseg=1024 | 1948.96 ms | 17.73 ms | 9.76 ms | 109.9x / 199.7x |
+| sosfilt (IIR) | 256ch x 2^20, butter-8 | 1319.27 ms | 42.69 ms | 11.80 ms | 30.9x / 111.8x |
+| sosfilt (IIR, 1ch scan) | 1ch x 2^22, butter-8 | 20.84 ms | 1.76 ms | 1.35 ms | 11.8x / 15.4x |
+| sosfiltfilt (IIR) | 256ch x 2^20, butter-8 | 2698.31 ms | 127.03 ms | 41.67 ms | 21.2x / 64.7x |
+| lfilter (IIR) | 256ch x 2^20, butter-4 tf | 1551.14 ms | 43.71 ms | 12.43 ms | 35.5x / 124.8x |
+| lfilter (IIR, 1ch scan) | 1ch x 2^22, butter-4 tf | 23.31 ms | 1.39 ms | 0.95 ms | 16.7x / 24.5x |
+| filtfilt (IIR) | 256ch x 2^20, butter-4 tf | 3090.99 ms | 128.11 ms | 41.22 ms | 24.1x / 75.0x |
+| find_peaks | 2^23, prominence=1 | 224.22 ms | 223.08 ms | — | 1.0x / — |

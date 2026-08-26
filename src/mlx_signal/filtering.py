@@ -1,11 +1,17 @@
 """Filtering: FIR design (host-side), FIR/IIR application (GPU), hilbert.
 
-FIR paths run on the GPU via FFT convolution. IIR in second-order-section form
-(:func:`sosfilt`/:func:`sosfiltfilt`) runs on the GPU through two custom Metal
-kernels — per-channel-sequential for short signals, block-parallel associative
-scan for long ones. Transfer-function IIR (``lfilter`` with ``len(a) > 1``)
-falls back to scipy with a :class:`~mlx_signal.FallbackWarning`; prefer the
-better-conditioned SOS form, as scipy itself recommends.
+FIR paths run on the GPU via FFT convolution. IIR runs on the GPU through
+custom Metal kernels — per-channel-sequential for short signals,
+block-parallel associative scan for long ones — in both second-order-section
+form (:func:`sosfilt`/:func:`sosfiltfilt`) and transfer-function form
+(:func:`lfilter`/:func:`filtfilt` with ``len(a) > 1``, up to order 16, real
+coefficients). The sequential kernels reproduce scipy's float32 recurrence
+bit-for-bit for normal-range data (Apple GPUs flush float32 denormals to
+zero; scipy's CPU keeps them); the block-parallel scan matches to ~1e-6 for
+typical wideband filters and ~1e-5 worst-case near its dispatch gate. The
+SOS form remains the better-conditioned choice for high orders, as scipy
+itself recommends; complex coefficients and orders past the register cap
+fall back to scipy with a :class:`~mlx_signal.FallbackWarning`.
 """
 
 from __future__ import annotations
@@ -102,6 +108,8 @@ def _as_fir_taps(b, a):
     if a_np.ndim != 1 or a_np.size != 1:
         return None
     ba = to_mlx(b)
+    if ba.ndim == 0:  # scalar b is a length-1 FIR, like scipy's atleast_1d
+        ba = ba.reshape(1)
     if ba.ndim != 1:
         return None
     a0 = complex(a_np[0]) if np.iscomplexobj(a_np) else float(a_np[0])
@@ -124,33 +132,464 @@ def _fir_causal(b: mx.array, x: mx.array) -> mx.array:
     return y[..., :n]
 
 
-def lfilter(b, a, x, axis=-1, zi=None):
-    """Filter data with an IIR or FIR filter (scipy-compatible signature).
+# ---------------------------------------------------------------------------
+# IIR: transfer-function form (order-N DF2T Metal kernel)
+# ---------------------------------------------------------------------------
 
-    The FIR case (``len(a) == 1``) runs on the GPU as a truncated FFT
-    convolution. IIR filters and ``zi`` initial conditions fall back to scipy
-    with a FallbackWarning (IIR-via-associative-scan is on the roadmap).
+
+def _validate_ba_np(b, a):
+    """Canonicalize ``(b, a)`` transfer-function coefficients to 1-D f32/c64.
+
+    Mirrors :func:`_validate_sos_np`: scipy's design routines return float64,
+    which canonicalizes quietly as design metadata; explicit complex128 warns
+    under the downcast policy; a filter whose stability or numerator does not
+    survive 32-bit quantization fails identically on every route.
     """
-    taps = _as_fir_taps(b, a)
-    work = input_size(x) * (1 if taps is None else max(1, taps.size))
-    if taps is None or zi is not None or not use_mlx(work):
-        if use_mlx(work):  # not a size decision: explain why we left the GPU
-            reason = "zi initial conditions" if taps is not None else "IIR filtering (len(a) > 1)"
-            capability_fallback("lfilter", reason)
+    check_strict(b)
+    check_strict(a)
+    b_raw = np.atleast_1d(np.asarray(to_numpy(b)))
+    a_raw = np.atleast_1d(np.asarray(to_numpy(a)))
+    for name, arr, orig in (("b", b_raw, b), ("a", a_raw, a)):
+        if arr.ndim != 1 or arr.size == 0:
+            raise ValueError(f"{name} must be 1-D with non-zero length")
+        explicit_array = isinstance(orig, (np.ndarray, mx.array))
+        if explicit_array and (
+            (arr.dtype.kind == "c" and arr.dtype.itemsize > 8)
+            or (arr.dtype.kind == "f" and arr.dtype.itemsize > 8)
+        ):
+            _downcast_notice(str(arr.dtype))
+
+    dtype = (np.complex64 if (np.iscomplexobj(b_raw) or np.iscomplexobj(a_raw))
+             else np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        b_np = np.ascontiguousarray(b_raw, dtype=dtype)
+        a_np = np.ascontiguousarray(a_raw, dtype=dtype)
+    if not (np.all(np.isfinite(b_np)) and np.all(np.isfinite(a_np))):
+        raise ValueError("filter coefficients must be finite after 32-bit quantization")
+    if a_np[0] == 0:
+        raise ValueError("a[0] must be nonzero")
+    dtype_name = np.dtype(dtype).name
+    if np.any(b_raw != 0) and np.all(b_np == 0):
+        raise ValueError(
+            f"numerator vanished after {dtype_name} quantization; "
+            "use a better-conditioned scaling"
+        )
+
+    if a_np.shape[0] > 1:
+        raw_a = np.asarray(a_raw, dtype=np.complex128)
+        raw_poles = np.roots(raw_a / raw_a[0])
+        poles = np.roots(np.asarray(a_np, dtype=np.complex128) / complex(a_np[0]))
+        raw_radius = float(np.max(np.abs(raw_poles))) if raw_poles.size else 0.0
+        radius = float(np.max(np.abs(poles))) if poles.size else 0.0
+        if raw_radius < 1.0 and (not np.isfinite(radius) or radius >= 1.0):
+            raise ValueError(
+                f"denominator is unstable after {dtype_name} quantization "
+                f"(maximum pole magnitude {radius:.9g} >= 1); use the SOS form "
+                "or a better-conditioned design"
+            )
+    return b_np, a_np
+
+
+def _tf_recurrence_f32_reference(b, a, x, zi):
+    """NumPy emulation of the TF kernel's exact fma rounding structure.
+
+    Products are exact in float64 and each stored value rounds through
+    float32, emulating fused multiply-adds (a true fma can disagree with this
+    double-rounded emulation ~2^-29 of the time — tolerable for the probe
+    below, whose false negatives only cost the conservative routing).
+    """
+    f32, f64 = np.float32, np.float64
+    order = max(len(b), len(a)) - 1
+    a0 = f32(a[0])
+    bb = np.zeros(order + 1, f64)
+    aa = np.zeros(order + 1, f64)
+    bb[: len(b)] = (np.asarray(b, f32) / a0).astype(f32)
+    aa[: len(a)] = (np.asarray(a, f32) / a0).astype(f32)
+    z = np.asarray(zi, f32).astype(f64).copy()
+    y = np.empty(len(x), f32)
+    for t in range(len(x)):
+        v = f64(f32(x[t]))
+        yv = f32(bb[0] * v + z[0])                              # fma(b0, x, z0)
+        for k in range(order - 1):                              # fma(-a, y, fma(b, x, z+1))
+            z[k] = f64(f32(f64(f32(bb[k + 1] * v + z[k + 1])) - aa[k + 1] * f64(yv)))
+        z[order - 1] = f64(f32(bb[order] * v - f64(f32(aa[order] * f64(yv)))))
+        y[t] = yv
+    return y, z.astype(f32)
+
+
+@_functools.lru_cache(maxsize=1)
+def _scipy_lfilter_f32_order_matches_metal() -> bool:
+    """Whether scipy's f32 TF recurrence rounds like our kernel.
+
+    scipy's lfilter C loop inherits the build compiler's fma-contraction
+    choices (measured: clang on arm64 fuses every multiply-add), so a version
+    gate cannot answer this — probe the installed build directly.
+    """
+    import scipy.signal as sps
+
+    rng = np.random.default_rng(20260826)
+    poles = np.asarray([0.5, 0.3 + 0.4j, 0.3 - 0.4j, -0.2 + 0.6j, -0.2 - 0.6j])
+    # a[0] = 1.7 on purpose: the probe must also cover scipy's in-loop
+    # normalization division, not just the a0 == 1 fast case
+    a = (np.real(np.poly(poles)) * 1.7).astype(np.float32)
+    b = (rng.standard_normal(6) * 1.7).astype(np.float32)
+    x = rng.standard_normal(257).astype(np.float32)
+    zi = (rng.standard_normal(5) * 0.1).astype(np.float32)
+    y_ref, zf_ref = _tf_recurrence_f32_reference(b, a, x, zi)
+    y, zf = sps.lfilter(b, a, x, zi=zi)
+    return bool(np.array_equal(y, y_ref) and np.array_equal(zf, zf_ref))
+
+
+#: transient-gain cap for the TF scan. Measured block-boundary drift relative
+#: to peak output: ~2-5e-8 x max_t ||A^t|| for well-damped filters (butter-4:
+#: 3.6e-7 at gain 18), but near-gate resonant families (repeated real poles,
+#: narrow resonators at gain ~20+) reach ~5e-7 x gain — worst observed 1.0e-5
+#: at this cap. 24 keeps every mainstream wideband design on the scan; a
+#: guaranteed ~1e-6 would need a cap of ~4, exiling butter-4 to the
+#: sequential kernel. Clustered high-order poles blow far past any cap
+#: (butter-8: 275, an order-8 bandpass: 5500) and always stay sequential —
+#: TF form at those orders is exactly where scipy says to use SOS instead.
+_TF_SCAN_MAX_GAIN = 24.0
+
+
+@_functools.lru_cache(maxsize=64)
+def _tf_scan_safe(a_bytes: bytes, order: int) -> bool:
+    """Scan-dispatch gate for the TF kernel.
+
+    Same decay requirement as the SOS gate — the response must die within one
+    scan block — plus bounds on the actual block transition: the DF2T
+    companion form is non-normal, so clustered poles transiently amplify f32
+    entry-state rounding even when every radius**L is tiny.
+    ``a_bytes`` is the float64 view of the f32-rounded normalized denominator.
+
+    The admitted drift bound is stated on _TF_SCAN_MAX_GAIN and is relative to
+    the internal state scale; a numerator that cancels most of that scale in
+    the passband (a deep notch) sees proportionally larger output-relative
+    drift, as it does for any float32 recurrence including scipy's own.
+    """
+    from . import _lfilter_metal
+
+    a = np.frombuffer(a_bytes, dtype=np.float64)
+    radius = float(np.max(np.abs(np.roots(a)))) if np.any(a[1:]) else 0.0
+    if radius >= 1.0 or radius ** _SCAN_BLOCK_REF > 1e-2:
+        return False
+    AL, gain = _lfilter_metal._transition_np(a_bytes, order, _SCAN_BLOCK_REF)
+    return bool(
+        np.all(np.isfinite(AL))
+        and float(np.max(np.abs(AL))) <= 1e-2
+        and gain <= _TF_SCAN_MAX_GAIN
+    )
+
+
+def _lfilter_tf(b_np, a_np, x, axis, zi):
+    """Transfer-function ``lfilter`` (``len(a) > 1``): GPU kernels + routing.
+
+    Mirrors :func:`sosfilt`'s dispatch: scipy below the size threshold or when
+    the kernel lacks the capability (complex coefficients, order past the
+    register cap, no Metal); the scan kernel for long scan-safe signals; the
+    per-channel-sequential kernel otherwise. Every route executes the same
+    f32-quantized filter; the sequential kernel reproduces scipy's recurrence
+    bit-for-bit (outside the denormal range, which the GPU flushes), and the
+    scan stays within the drift bound stated on _TF_SCAN_MAX_GAIN.
+    """
+    from . import _lfilter_metal
+
+    order = max(b_np.shape[0], a_np.shape[0]) - 1
+    xa = to_mlx(x)
+    if xa.ndim < 1:
+        raise ValueError("x must be at least 1-D with samples along axis")
+    if not -xa.ndim <= axis < xa.ndim:
+        raise ValueError(
+            f"axis {axis} is out of range for an input with {xa.ndim} dimension(s)"
+        )
+    ax = axis % xa.ndim
+    n = xa.shape[ax]
+
+    zi_a = None
+    if zi is not None:
+        zi_a = to_mlx(zi)
+        if zi_a.ndim != xa.ndim:
+            raise ValueError(
+                "Dimensions of x and zi must match, but "
+                f"x.ndim={xa.ndim}, zi.ndim={zi_a.ndim}"
+            )
+        expected = list(xa.shape)
+        expected[ax] = order
+        ok = all(
+            zs == e or (i != ax and zs == 1)
+            for i, (zs, e) in enumerate(zip(zi_a.shape, expected, strict=True))
+        )
+        if not ok:
+            raise ValueError(
+                f"Unexpected shape for zi: expected {tuple(expected)}, "
+                f"found {tuple(zi_a.shape)}."
+            )
+        zi_a = mx.broadcast_to(zi_a, tuple(expected))
+
+    complex_coeffs = np.iscomplexobj(b_np)
+    kernel_ok = (
+        mx.metal.is_available()
+        and not complex_coeffs
+        and order <= _lfilter_metal.MAX_ORDER
+    )
+
+    def _scipy_path():
         import scipy.signal as sps
 
-        out = sps.lfilter(to_numpy(b), to_numpy(a), signal_np(x), axis=axis, zi=zi)
+        # canonicalized signal/state, like sosfilt's fallback: routing by size
+        # or batch count must never change the recurrence precision
+        x_np = to_numpy(xa)
+        zi_np = to_numpy(zi_a) if zi is not None else None
+        split_complex = not complex_coeffs and (
+            np.iscomplexobj(x_np) or (zi_np is not None and np.iscomplexobj(zi_np))
+        )
+        if split_complex:
+            # mirror the Metal two-plane arithmetic (scipy's native complex64
+            # recurrence rounds in a different order)
+            xr = np.asarray(np.real(x_np), dtype=np.float32)
+            xi = (
+                np.asarray(np.imag(x_np), dtype=np.float32)
+                if np.iscomplexobj(x_np)
+                else np.zeros_like(xr)
+            )
+            j = np.complex64(1j)
+            if zi_np is None:
+                yr = sps.lfilter(b_np, a_np, xr, axis=axis)
+                yi = sps.lfilter(b_np, a_np, xi, axis=axis)
+                out = np.asarray(yr, dtype=np.complex64) + j * yi
+            else:
+                zir = np.asarray(np.real(zi_np), dtype=np.float32)
+                zii = (
+                    np.asarray(np.imag(zi_np), dtype=np.float32)
+                    if np.iscomplexobj(zi_np)
+                    else np.zeros_like(zir)
+                )
+                yr, zfr = sps.lfilter(b_np, a_np, xr, axis=axis, zi=zir)
+                yi, zfi = sps.lfilter(b_np, a_np, xi, axis=axis, zi=zii)
+                out = (
+                    np.asarray(yr, dtype=np.complex64) + j * yi,
+                    np.asarray(zfr, dtype=np.complex64) + j * zfi,
+                )
+        else:
+            x_c = x_np if not complex_coeffs else np.asarray(x_np, dtype=np.complex64)
+            zi_c = (
+                None if zi_np is None
+                else zi_np if not complex_coeffs
+                else np.asarray(zi_np, dtype=np.complex64)
+            )
+            out = sps.lfilter(b_np, a_np, x_c, axis=axis, zi=zi_c)
         if zi is not None:
             return result_to_mlx(out[0]), result_to_mlx(out[1])
         return result_to_mlx(out)
 
+    if n == 0 or not use_mlx(xa.size * order):
+        return _scipy_path()
+    if not kernel_ok:
+        reason = ("complex filter coefficients" if complex_coeffs
+                  else f"order {order} exceeds the kernel cap of "
+                       f"{_lfilter_metal.MAX_ORDER}"
+                  if order > _lfilter_metal.MAX_ORDER
+                  else "no Metal GPU")
+        capability_fallback("lfilter", reason)
+        return _scipy_path()
+
+    # pre-normalize in f32: bit-identical to scipy's in-loop f32 b[k] / a[0]
+    # (which also divides silently — hence the errstate — and produces the
+    # same inf/NaN coefficients for a pathological a[0])
+    ba = np.zeros((2, order + 1), dtype=np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        ba[0, : b_np.shape[0]] = (b_np / a_np[0]).astype(np.float32)
+        ba[1, : a_np.shape[0]] = (a_np / a_np[0]).astype(np.float32)
+    a64 = np.ascontiguousarray(ba[1], dtype=np.float64)
+    scan_safe = _tf_scan_safe(a64.tobytes(), order)
+    use_scan = n >= _SCAN_MIN_N and scan_safe
+    if (
+        get_config().dispatch == "auto"
+        and not scan_safe
+        and not _scipy_lfilter_f32_order_matches_metal()
+    ):
+        # a scipy build whose f32 rounding differs from the kernel must not
+        # switch recurrence with auto routing on a long-lived filter
+        return _scipy_path()
+    batch = xa.size // n
+    if (
+        get_config().dispatch == "auto"
+        and not use_scan
+        and batch < _SOSFILT_MIN_ROWS
+    ):
+        # short signal, few channels: scipy's single fast core wins
+        return _scipy_path()
+
+    ba_flat = mx.array(ba.reshape(-1))
+
+    def _run(x2p, zi2p):
+        if use_scan:
+            return _lfilter_metal.lfilter_scan_gpu(x2p, ba, zi2p)
+        return _lfilter_metal.lfilter_gpu(x2p, ba_flat, zi2p)
+
+    moved = xa.ndim > 1 and ax != xa.ndim - 1
+    if moved:
+        xa = mx.moveaxis(xa, ax, -1)
+    batch_shape = xa.shape[:-1]
+    x2 = xa.reshape(-1, n)
+
+    if zi is not None:
+        zi_m = mx.moveaxis(zi_a, ax, -1) if moved else zi_a
+        zi2 = zi_m.reshape(-1, order)
+    else:
+        zi2 = mx.zeros((x2.shape[0], order))
+
+    complex_state = zi is not None and zi2.dtype == mx.complex64
+    if x2.dtype == mx.complex64 or complex_state:
+        # filtering is linear: real and imaginary parts run as two launches
+        if x2.dtype != mx.complex64:
+            x2 = x2.astype(mx.complex64)
+        if zi is not None and zi2.dtype != mx.complex64:
+            zi2 = zi2.astype(mx.complex64)
+        yr, zr = _run(mx.real(x2), mx.real(zi2))
+        yi, zim = _run(mx.imag(x2), mx.imag(zi2))
+        j = mx.array(1j)
+        y2 = yr.astype(mx.complex64) + yi.astype(mx.complex64) * j
+        zf2 = zr.astype(mx.complex64) + zim.astype(mx.complex64) * j
+    else:
+        y2, zf2 = _run(x2, zi2)
+
+    y = y2.reshape(batch_shape + (n,))
+    if moved:
+        y = mx.moveaxis(y, -1, ax)
+    if zi is None:
+        return y
+    zf = zf2.reshape(batch_shape + (order,))
+    if moved:
+        zf = mx.moveaxis(zf, -1, ax)
+    return y, zf
+
+
+def lfilter(b, a, x, axis=-1, zi=None):
+    """Filter data with an IIR or FIR filter (scipy-compatible signature).
+
+    The FIR case (``len(a) == 1``) runs on the GPU as a truncated FFT
+    convolution. Transfer-function IIR (``len(a) > 1``) runs on the GPU
+    through order-N direct-form-II-transposed Metal kernels (sequential and
+    block-parallel scan, like :func:`sosfilt`) that reproduce scipy's float32
+    recurrence bit-for-bit, with the full ``zi``/``zf`` contract. Complex
+    coefficients and orders above 16 fall back to scipy with a
+    FallbackWarning; ``zi`` with ``len(a) == 1`` follows scipy's FIR
+    convolution path on the CPU.
+    """
+    taps = _as_fir_taps(b, a)
+    if taps is not None:
+        work = input_size(x) * max(1, taps.size)
+        if zi is not None or not use_mlx(work):
+            if zi is not None and use_mlx(work):
+                capability_fallback("lfilter", "zi initial conditions")
+            import scipy.signal as sps
+
+            out = sps.lfilter(to_numpy(b), to_numpy(a), signal_np(x), axis=axis, zi=zi)
+            if zi is not None:
+                return result_to_mlx(out[0]), result_to_mlx(out[1])
+            return result_to_mlx(out)
+
+        xa = to_mlx(x)
+        moved = xa.ndim > 1 and axis not in (-1, xa.ndim - 1)
+        if moved:
+            xa = mx.moveaxis(xa, axis, -1)
+        y = _fir_causal(taps, xa)
+        if moved:
+            y = mx.moveaxis(y, -1, axis)
+        return y
+
+    b_np, a_np = _validate_ba_np(b, a)
+    return _lfilter_tf(b_np, a_np, x, axis, zi)
+
+
+def _filtfilt_tf(b_np, a_np, x, axis, padtype, padlen, method, irlen):
+    """Transfer-function ``filtfilt``: scipy's pad method through our lfilter.
+
+    The same construction :func:`sosfiltfilt` uses — edge extension,
+    ``lfilter_zi`` steady-state initialization scaled by the edge samples, a
+    forward and a reverse pass, trim — with both passes routed through
+    :func:`lfilter`, so the TF Metal kernels (or the scipy routing) apply to
+    each. ``method="gust"`` and complex coefficients go to scipy wholesale.
+    """
+    order = max(b_np.shape[0], a_np.shape[0]) - 1
+    complex_coeffs = np.iscomplexobj(b_np)
     xa = to_mlx(x)
-    moved = xa.ndim > 1 and axis not in (-1, xa.ndim - 1)
+    if xa.ndim < 1:
+        raise ValueError("x must be at least 1-D with samples along axis")
+    if not -xa.ndim <= axis < xa.ndim:
+        raise ValueError(
+            f"axis {axis} is out of range for an input with {xa.ndim} dimension(s)"
+        )
+    # real coefficients always use the shared pad construction below (the two
+    # inner lfilter calls honor size dispatch) so complex signals run the same
+    # two-plane recurrence on every route — a wholesale sps.filtfilt call for
+    # small inputs would switch to scipy's native complex64 recurrence and
+    # make the silent size boundary visible, exactly like sosfiltfilt's fix
+    if method == "gust" or complex_coeffs:
+        if use_mlx(xa.size * max(1, order)):
+            reason = ("method='gust'" if method == "gust"
+                      else "complex filter coefficients")
+            capability_fallback("filtfilt", reason)
+        import scipy.signal as sps
+
+        return result_to_mlx(
+            sps.filtfilt(b_np, a_np, to_numpy(xa), axis=axis, padtype=padtype,
+                         padlen=padlen, method=method, irlen=irlen)
+        )
+
+    if padtype not in ("even", "odd", "constant", None):
+        raise ValueError(
+            f"Unknown value '{padtype}' given to padtype. padtype must be 'even', "
+            "'odd', 'constant', or None."
+        )
+
+    ntaps = max(b_np.shape[0], a_np.shape[0])
+    if padtype is None:
+        edge = 0
+    elif padlen is None:
+        edge = 3 * ntaps
+    else:
+        edge = int(padlen)
+
+    ax = axis % xa.ndim
+    if xa.shape[ax] <= edge:
+        raise ValueError(
+            "The length of the input vector x must be greater than padlen, "
+            f"which is {edge}."
+        )
+
+    moved = xa.ndim > 1 and ax != xa.ndim - 1
     if moved:
-        xa = mx.moveaxis(xa, axis, -1)
-    y = _fir_causal(taps, xa)
+        xa = mx.moveaxis(xa, ax, -1)
+
+    if edge > 0:
+        ext_func = {"even": even_ext, "odd": odd_ext, "constant": const_ext}[padtype]
+        ext = ext_func(xa, edge)
+    else:
+        ext = xa
+
+    from scipy.signal import lfilter_zi as _lfilter_zi
+
+    # scipy's f32 construction on the exact coefficients every route executes,
+    # like sosfiltfilt: the direct scipy recurrence and the Metal kernels both
+    # consume these state values
+    # ascontiguousarray: lfilter_zi can return a negative-stride view, which
+    # mx.array refuses through DLPack
+    zi_np = np.ascontiguousarray(_lfilter_zi(b_np, a_np), dtype=np.float32)  # (order,)
+    zi_shape = [1] * ext.ndim
+    zi_shape[-1] = order
+    zi_r = mx.array(zi_np).reshape(zi_shape)
+
+    x_0 = ext[..., :1]
+    y, _ = lfilter(b_np, a_np, ext, axis=-1, zi=zi_r * x_0)
+    y_0 = y[..., -1:]
+    y, _ = lfilter(b_np, a_np, y[..., ::-1], axis=-1, zi=zi_r * y_0)
+    y = y[..., ::-1]
+    if edge > 0:
+        y = y[..., edge:-edge]
     if moved:
-        y = mx.moveaxis(y, -1, axis)
+        y = mx.moveaxis(y, -1, ax)
     return y
 
 
@@ -160,18 +599,23 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
     The FIR case runs on the GPU: odd/even/constant edge extension, then a
     forward and a backward causal convolution with scipy's exact steady-state
     initialization (implemented as an (ntaps-1)-sample constant prefix, which
-    is algebraically identical to ``lfilter_zi`` for FIR filters). IIR filters
-    and ``method="gust"`` fall back to scipy.
+    is algebraically identical to ``lfilter_zi`` for FIR filters). The IIR
+    case (``len(a) > 1``) runs both passes through :func:`lfilter`'s TF Metal
+    kernels with scipy's exact pad construction. ``method="gust"`` and complex
+    coefficients fall back to scipy.
     """
     if method not in ("pad", "gust"):
         raise ValueError("method must be 'pad' or 'gust'.")
 
     taps = _as_fir_taps(b, a)
-    work = input_size(x) * (1 if taps is None else max(1, taps.size))
-    if taps is None or method == "gust" or not use_mlx(work):
+    if taps is None:
+        b_np, a_np = _validate_ba_np(b, a)
+        return _filtfilt_tf(b_np, a_np, x, axis, padtype, padlen, method, irlen)
+
+    work = input_size(x) * max(1, taps.size)
+    if method == "gust" or not use_mlx(work):
         if use_mlx(work):
-            reason = "method='gust'" if taps is not None else "IIR filtering (len(a) > 1)"
-            capability_fallback("filtfilt", reason)
+            capability_fallback("filtfilt", "method='gust'")
         import scipy.signal as sps
 
         return result_to_mlx(
