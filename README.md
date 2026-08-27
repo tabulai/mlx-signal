@@ -137,7 +137,7 @@ python -m pytest -q         # full golden suite against scipy and NumPy
 |---|---|---|
 | spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernels on the pow2 hot path (two-signal csd/coherence variant, inverse+gather-OLA for istft), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; pow2-padded FFTs; long×short convolutions auto-block, and filters ≤1025 taps run a fused kernel pair (block FFT, spectrum multiply, inverse FFT in threadgroup memory) reassembled by gather-OLA; `fftconvolve(x, x)` and `correlate(x, x)` skip the second forward transform |
-| resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, polyphase geometry in 32-bit arithmetic whenever indices fit (Apple GPUs emulate 64-bit divides — worth ~4x at high `up`), taps staged through threadgroup memory only where measured to pay (pure decimation with a wide gather stride), complex-native — an IQ stream is one launch |
+| resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, polyphase geometry in 32-bit arithmetic whenever indices fit (Apple GPUs emulate 64-bit divides — worth ~4x at high `up`), taps staged through threadgroup memory only where measured to pay (pure decimation with a wide gather stride), complex-native — an IQ stream is one launch; every scipy signal-extension mode via on-device boundary extension, and the statistical padtypes via on-device background subtraction |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR, SOS-IIR, and transfer-function-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up; tf form to order 16 with native `zi`/`zf`) with scipy-exact edge handling; design host-side |
 | peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; prominence base-search on GPU for f32 sources (one thread per peak, two-level block-skip scan), index bookkeeping host-side |
 | utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
@@ -182,9 +182,9 @@ with sig.config_context(gpu_min_size=1 << 18):  # scoped
     ...
 ```
 
-Capability fallbacks (complex IIR coefficients, tf orders past 16, exotic
-padding modes, callable detrend) warn loudly; size-based routing is silent by
-design.
+Capability fallbacks (complex IIR coefficients, tf orders past 16, callable
+detrend, boundary modes on signals shorter than their extension) warn loudly;
+size-based routing is silent by design.
 
 ## Dtype policy
 
@@ -228,8 +228,10 @@ them, so bit-identity claims for the IIR kernels hold for normal-range data.
 - `lfilter`/`sosfilt` take and return `zi`/`zf` state natively on the GPU for
   IIR filters; FIR `lfilter` with `zi` follows scipy's convolution path on the
   CPU (falls back, warns).
-- `upfirdn` supports the default zero-padded `mode="constant"` on the GPU; other
-  signal-extension modes fall back.
+- `upfirdn` serves every scipy signal-extension mode on the GPU by
+  pre-extending the boundary on-device; only signals shorter than the
+  required boundary extension (roughly the tap count over `up`, rounded up
+  for downsample-phase alignment) fall back.
 - Streaming/chunked APIs, `ShortTimeFFT`, and CWT are not yet implemented (below).
 
 ## Roadmap

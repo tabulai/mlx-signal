@@ -159,16 +159,170 @@ def test_upfirdn_gpu_empty_taps_stores_zeros():
     np.testing.assert_array_equal(np.array(out), np.zeros((2, 199), np.float32))
 
 
-def test_upfirdn_pad_mode_falls_back(rng):
-    x = rng.standard_normal(300).astype(np.float32)
-    h = rng.standard_normal(21).astype(np.float32)
+@pytest.mark.parametrize("mode", ["wrap", "edge", "smooth", "symmetric", "reflect",
+                                  "antisymmetric", "antireflect", "line"])
+@pytest.mark.parametrize("up,down", [(2, 3), (1, 10), (7, 3)])
+def test_upfirdn_modes_run_on_device(rng, mode, up, down):
+    """Every scipy signal-extension mode is served by pre-extending on-device
+    and running the constant kernel — no fallback, no warning."""
+    import warnings as _w
+
+    x = rng.standard_normal((3, 700)).astype(np.float32)
+    h = rng.standard_normal(63).astype(np.float32)
+    ref = sps.upfirdn(h, x, up, down, mode=mode)
+    with _w.catch_warnings():
+        _w.simplefilter("error", msig.FallbackWarning)
+        out = msig.upfirdn(h, x, up, down, mode=mode)
+    assert ref.shape == tuple(np.array(out).shape)
+    assert_close(out, ref, rtol=2e-5, atol_frac=2e-6)
+
+
+def test_upfirdn_mode_complex_signal(rng):
+    x = (rng.standard_normal(600) + 1j * rng.standard_normal(600)).astype(np.complex64)
+    h = rng.standard_normal(41).astype(np.float32)
+    assert_close(msig.upfirdn(h, x, 3, 2, mode="reflect"),
+                 sps.upfirdn(h, x, 3, 2, mode="reflect"), rtol=2e-5, atol_frac=2e-6)
+
+
+def test_upfirdn_constant_cval(rng):
+    x = rng.standard_normal(500).astype(np.float32)
+    h = rng.standard_normal(31).astype(np.float32)
+    assert_close(msig.upfirdn(h, x, 2, 3, cval=1.5),
+                 sps.upfirdn(h, x, 2, 3, cval=1.5), rtol=2e-5, atol_frac=2e-6)
+
+
+def test_upfirdn_mode_short_signal_falls_back(rng):
+    """A signal shorter than the boundary extension can't be single-fold
+    reflected; that corner keeps scipy, loudly."""
+    x = rng.standard_normal(40).astype(np.float32)
+    h = rng.standard_normal(255).astype(np.float32)
     with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
-        with pytest.warns(msig.FallbackWarning):
-            out = msig.upfirdn(h, x, 2, 1, mode="smooth")
-    assert_close(out, sps.upfirdn(h, x, 2, 1, mode="smooth"))
+        with pytest.warns(msig.FallbackWarning, match="shorter"):
+            out = msig.upfirdn(h, x, 2, 3, mode="reflect")
+    assert_close(out, sps.upfirdn(h, x, 2, 3, mode="reflect"))
     if HAS_GPU:  # fixture pins dispatch="mlx" only when Metal exists
         with pytest.raises(NotImplementedError):
-            msig.upfirdn(h, x, 2, 1, mode="smooth")
+            msig.upfirdn(h, x, 2, 3, mode="reflect")
+
+
+def test_upfirdn_unknown_mode_raises(rng):
+    with pytest.raises(ValueError, match="Unknown mode"):
+        msig.upfirdn(np.ones(5, np.float32), rng.standard_normal(100).astype(np.float32),
+                     2, 1, mode="bogus")
+
+
+@pytest.mark.parametrize("padtype", ["mean", "median", "maximum", "minimum",
+                                     "reflect", "smooth", "line", "wrap"])
+def test_resample_poly_padtypes_match_scipy(rng, padtype):
+    x = (rng.standard_normal((5, 2000)) + 3.0).astype(np.float32)
+    ref = sps.resample_poly(x, 147, 160, axis=-1, padtype=padtype)
+    import warnings as _w
+
+    with _w.catch_warnings():
+        _w.simplefilter("error", msig.FallbackWarning)
+        out = msig.resample_poly(x, 147, 160, axis=-1, padtype=padtype)
+    assert ref.shape == tuple(np.array(out).shape)
+    assert_close(out, ref, rtol=2e-4)
+
+
+def test_resample_poly_constant_cval(rng):
+    x = rng.standard_normal(2000).astype(np.float32)
+    assert_close(msig.resample_poly(x, 2, 3, padtype="constant", cval=0.7),
+                 sps.resample_poly(x, 2, 3, padtype="constant", cval=0.7), rtol=2e-4)
+
+
+@pytest.mark.parametrize("padtype", ["median", "maximum", "minimum", "mean"])
+def test_resample_poly_complex_stat_padtypes_on_device(rng, padtype):
+    """MLX sorts/reduces complex64 with numpy's lexicographic convention, so
+    the statistical padtypes serve complex signals without fallback."""
+    import warnings as _w
+
+    x = (rng.standard_normal(5000) + 1j * rng.standard_normal(5000)).astype(np.complex64)
+    ref = sps.resample_poly(x, 3, 2, padtype=padtype)
+    with _w.catch_warnings():
+        _w.simplefilter("error", msig.FallbackWarning)
+        out = msig.resample_poly(x, 3, 2, padtype=padtype)
+    assert_close(out, ref, rtol=2e-4)
+
+
+def test_resample_poly_median_even_length_averages_middles():
+    """np.median of an even-length axis averages the two middle order
+    statistics; a tiny skewed signal pins the exact background value."""
+    x = np.array([1.0, 2.0, 3.0, 100.0], np.float32)  # median 2.5, not 3.0
+    with msig.config_context(gpu_min_size=0):
+        out = np.array(msig.resample_poly(x, 3, 2, padtype="median"))
+    ref = sps.resample_poly(x, 3, 2, padtype="median")
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5 * np.abs(ref).max())
+
+
+def test_resample_poly_median_propagates_nan(rng):
+    """np.median returns NaN when any element is NaN; sorting alone would
+    hide the NaN at the end and pick a finite middle."""
+    x = rng.standard_normal(3000).astype(np.float32)
+    x[1500] = np.nan
+    with msig.config_context(gpu_min_size=0):
+        out = np.array(msig.resample_poly(x, 3, 2, padtype="median"))
+    ref = sps.resample_poly(x, 3, 2, padtype="median")
+    np.testing.assert_array_equal(np.isnan(out), np.isnan(ref))
+
+
+def test_upfirdn_mode_boundary_signal_lengths(rng):
+    """The constructibility guard sits exactly where the extension slices stay
+    in range: at the boundary n the mode runs on-device and matches scipy; one
+    sample shorter falls back loudly. (up=2, down=3, 63 taps: left extension
+    L=33 after alignment, right R=31.)"""
+    import warnings as _w
+
+    h = rng.standard_normal(63).astype(np.float32)
+    for mode, n_ok in [("symmetric", 33), ("antisymmetric", 33), ("wrap", 33),
+                       ("reflect", 34), ("antireflect", 34)]:
+        x = rng.standard_normal(n_ok).astype(np.float32)
+        with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
+            with _w.catch_warnings():
+                _w.simplefilter("error", msig.FallbackWarning)
+                out = msig.upfirdn(h, x, 2, 3, mode=mode)
+        assert_close(out, sps.upfirdn(h, x, 2, 3, mode=mode), rtol=2e-5, atol_frac=2e-6)
+
+        x_short = rng.standard_normal(n_ok - 1).astype(np.float32)
+        with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
+            with pytest.warns(msig.FallbackWarning, match="shorter"):
+                out = msig.upfirdn(h, x_short, 2, 3, mode=mode)
+        assert_close(out, sps.upfirdn(h, x_short, 2, 3, mode=mode),
+                     rtol=2e-5, atol_frac=2e-6)
+
+
+def test_upfirdn_mode_case_insensitive(rng):
+    """scipy lowercases mode strings; so do we (padtype stays exact-match,
+    also like scipy)."""
+    x = rng.standard_normal(500).astype(np.float32)
+    h = rng.standard_normal(31).astype(np.float32)
+    assert_close(msig.upfirdn(h, x, 2, 3, mode="REFLECT"),
+                 sps.upfirdn(h, x, 2, 3, mode="REFLECT"), rtol=2e-5, atol_frac=2e-6)
+
+
+def test_upfirdn_complex_cval_raises_like_scipy(rng):
+    x = rng.standard_normal(500).astype(np.float32)
+    h = rng.standard_normal(31).astype(np.float32)
+    with pytest.raises(TypeError):
+        msig.upfirdn(h, x, 2, 3, cval=1 + 2j)
+
+
+def test_upfirdn_empty_input_nonzero_cval(rng):
+    """Empty input with a nonzero cval still has well-defined outputs (tap
+    sums over the pure-cval extension); scipy computes them and so must we."""
+    h = np.array([1.0, -2.0, 3.0, 1.0, 2.0], np.float32)
+    x = np.zeros(0, np.float32)
+    ref = sps.upfirdn(h, x, 2, 3, cval=5.0)
+    out = np.array(msig.upfirdn(h, x, 2, 3, cval=5.0))
+    np.testing.assert_allclose(out, ref, rtol=1e-6)
+
+
+def test_resample_poly_bad_padtype_raises_after_identity_shortcut(rng):
+    x = rng.standard_normal(100).astype(np.float32)
+    with pytest.raises(ValueError, match="padtype must be one of"):
+        msig.resample_poly(x, 2, 3, padtype="bogus")
+    # scipy validates padtype only after the up == down early return
+    np.testing.assert_array_equal(np.array(msig.resample_poly(x, 3, 3, padtype="bogus")), x)
 
 
 RESAMPLE_POLY_CASES = [(2, 1), (1, 2), (3, 2), (2, 3), (160, 147), (7, 3), (4, 2), (5, 5)]

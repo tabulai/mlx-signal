@@ -199,13 +199,76 @@ def _upfirdn_plane_dispatch(x2: mx.array, h: mx.array, up: int, down: int,
     return upfirdn_gpu(x2, h, up, down, n_out)
 
 
+#: scipy's upfirdn signal-extension modes, all served by pre-extending the
+#: signal on-device and running the constant-mode kernel on the extension
+_UPFIRDN_MODES = ("constant", "wrap", "edge", "smooth", "symmetric", "reflect",
+                  "antisymmetric", "antireflect", "line")
+
+
+def _extend_plane(x2: mx.array, L: int, R: int, mode: str, cval) -> mx.array:
+    """Extend (B, n) planes left by L and right by R with scipy's upfirdn
+    boundary modes. Convention trap (verified against scipy sample by
+    sample): ``antireflect`` anchors an odd reflection at the edge value
+    (2*edge - reflection) like numpy's reflect_type='odd', but
+    ``antisymmetric`` is the plain NEGATED symmetric reflection."""
+    n = x2.shape[-1]
+    B = x2.shape[0]
+    if mode == "constant":
+        c = mx.full((1, 1), cval).astype(x2.dtype)
+        left = mx.broadcast_to(c, (B, L))
+        right = mx.broadcast_to(c, (B, R))
+    elif mode == "edge":
+        left = mx.broadcast_to(x2[:, :1], (B, L))
+        right = mx.broadcast_to(x2[:, -1:], (B, R))
+    elif mode in ("symmetric", "antisymmetric"):
+        left = x2[:, :L][:, ::-1]
+        right = x2[:, n - R:][:, ::-1]
+        if mode == "antisymmetric":
+            left = -left
+            right = -right
+    elif mode in ("reflect", "antireflect"):
+        left = x2[:, 1:L + 1][:, ::-1]
+        right = x2[:, n - R - 1:n - 1][:, ::-1]
+        if mode == "antireflect":
+            left = 2 * x2[:, :1] - left
+            right = 2 * x2[:, -1:] - right
+    elif mode == "wrap":
+        left = x2[:, n - L:]
+        right = x2[:, :R]
+    elif mode == "smooth":
+        left = x2[:, :1] + (x2[:, 1:2] - x2[:, :1]) * mx.arange(-L, 0, dtype=mx.float32)
+        right = x2[:, -1:] + (x2[:, -1:] - x2[:, -2:-1]) * mx.arange(1, R + 1, dtype=mx.float32)
+    else:  # line
+        slope = (x2[:, -1:] - x2[:, :1]) / (n - 1)
+        left = x2[:, :1] + slope * mx.arange(-L, 0, dtype=mx.float32)
+        right = x2[:, -1:] + slope * mx.arange(1, R + 1, dtype=mx.float32)
+    return mx.concatenate([left, x2, right], axis=-1)
+
+
+def _extension_lengths(n_taps: int, up: int, down: int) -> tuple[int, int]:
+    """(left, right) extension lengths: enough to cover the tap window past
+    each edge, with the LEFT length rounded up so left*up is divisible by
+    down — otherwise the extended output grid is phase-shifted against the
+    unextended one and the slice below returns subtly wrong samples."""
+    base = -(-(n_taps - 1) // up)
+    d_align = down // math.gcd(up, down)
+    left = -(-base // d_align) * d_align
+    return left, base
+
+
 def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
     """Upsample by ``up``, FIR filter with ``h``, downsample by ``down``.
 
-    scipy-compatible. On the GPU this runs a custom Metal kernel: one thread
-    per output sample, each computing one polyphase dot product, with filter
-    taps staged in threadgroup memory. Signal-extension modes other than
-    zero-padded ``"constant"`` fall back to scipy.
+    scipy-compatible, including every signal-extension ``mode``. On the GPU
+    this runs a custom Metal kernel: one thread per output sample, each
+    computing one polyphase dot product. Non-constant modes pre-extend the
+    signal on-device (a few boundary samples of cheap MLX ops), run the
+    constant-mode kernel on the extension, and slice the aligned output
+    window back out — only signals shorter than the required extension fall
+    back to scipy. One f32 corner: with ``|cval|`` more than ~2^24 times the
+    signal scale and partially cancelling boundary taps, the kernel's
+    ascending-tap accumulation can round boundary outputs differently from
+    scipy's per-phase order (both are valid f32 sums of the same terms).
     """
     up, down = int(up), int(down)
     if up < 1 or down < 1:
@@ -214,21 +277,28 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
     ha = to_mlx(h)
     if ha.ndim != 1 or ha.size == 0:
         raise ValueError("h must be 1-D with non-zero length")
-
-    if mode != "constant" or cval not in (0, 0.0, None):
-        capability_fallback("upfirdn", f"signal extension mode={mode!r}")
-        import scipy.signal as sps
-
-        return result_to_mlx(
-            sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down, axis=axis,
-                        mode=mode, cval=cval)
-        )
+    mode = mode.lower()  # scipy lowercases mode strings
+    if mode not in _UPFIRDN_MODES:
+        raise ValueError(f"Unknown mode: {mode}")
+    # scipy's C-level double cast: complex (even 0j) raises TypeError
+    cval = 0.0 if cval is None else float(cval)
 
     xa = to_mlx(x)
     n_in = xa.shape[axis]
     n_taps = ha.shape[0]
     n_out = _output_len(n_taps, n_in, up, down)
-    if n_in == 0:  # scipy returns zeros of the formula-implied output length
+    if n_in == 0:
+        if mode == "constant" and cval != 0:
+            # the formula-implied outputs are tap-window sums over the pure
+            # cval extension — well-defined, and scipy computes them exactly
+            import scipy.signal as sps
+
+            return result_to_mlx(
+                sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down,
+                            axis=axis, mode=mode, cval=cval)
+            )
+        # scipy returns zeros of the formula-implied output length (its
+        # reflect-family output on empty input is uninitialized memory)
         shape = list(xa.shape)
         shape[axis] = max(0, n_out)
         dtype = (mx.complex64 if mx.complex64 in (xa.dtype, ha.dtype)
@@ -242,8 +312,37 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down, axis=axis)
+            sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down, axis=axis,
+                        mode=mode, cval=cval)
         )
+
+    ext = not (mode == "constant" and cval == 0)
+    if ext:
+        L, R = _extension_lengths(n_taps, up, down)
+        if L == 0 and R == 0:
+            ext = False  # a 1-tap filter never reaches past the edges
+        else:
+            constructible = (
+                mode in ("constant", "edge")
+                or (mode in ("smooth", "line") and n_in >= 2)
+                or (mode in ("symmetric", "antisymmetric", "wrap")
+                    and max(L, R) <= n_in)
+                or (mode in ("reflect", "antireflect") and max(L, R) <= n_in - 1)
+            )
+            if not constructible:
+                # multi-fold reflection of a signal shorter than the filter's
+                # boundary reach; rare, and scipy synthesizes it exactly
+                capability_fallback(
+                    "upfirdn",
+                    f"mode={mode!r} with a signal shorter than the "
+                    f"{max(L, R)}-sample boundary extension",
+                )
+                import scipy.signal as sps
+
+                return result_to_mlx(
+                    sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down,
+                                axis=axis, mode=mode, cval=cval)
+                )
 
     moved = xa.ndim > 1
     if moved:
@@ -251,10 +350,19 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
     batch_shape = xa.shape[:-1]
     x2 = xa.reshape(-1, n_in) if xa.ndim != 2 else xa
 
+    run_n_out = n_out
+    if ext:
+        x2 = _extend_plane(x2, L, R, mode, cval)
+        run_n_out = _output_len(n_taps, n_in + L + R, up, down)
+
     if mx.metal.is_available():
-        out = _upfirdn_plane_dispatch(x2, ha, up, down, n_out)
+        out = _upfirdn_plane_dispatch(x2, ha, up, down, run_n_out)
     else:
         out = _upfirdn_composed(x2, ha, up, down)
+
+    if ext:
+        off = (L * up) // down
+        out = out[..., off:off + n_out]
 
     out = out.reshape(batch_shape + (n_out,))
     if moved:
@@ -268,8 +376,10 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
 
     The anti-aliasing FIR filter is designed host-side exactly like scipy
     (``firwin(2*10*max(up, down)+1, 1/max(up, down), window)``), then applied
-    with the GPU upfirdn kernel. ``padtype`` values other than the default
-    zero-padded ``"constant"`` fall back to scipy for now.
+    with the GPU upfirdn kernel. Every scipy ``padtype`` is supported: the
+    statistical ones (``mean``/``median``/``maximum``/``minimum``) subtract a
+    per-channel background around a zero-padded pass exactly like scipy, and
+    the signal-extension ones ride upfirdn's on-device boundary extension.
     """
     if up != int(up):
         raise ValueError("up must be an integer")
@@ -281,22 +391,12 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
     if cval is not None and padtype != "constant":
         raise ValueError(f"cval has no effect when padtype is {padtype!r}")
 
-    if padtype != "constant" or cval not in (None, 0, 0.0):
-        capability_fallback("resample_poly", f"padtype={padtype!r}/cval={cval!r}")
-        import scipy.signal as sps
-
-        win = window if isinstance(window, str | tuple) else to_numpy(window)
-        return result_to_mlx(
-            sps.resample_poly(signal_np(x), up, down, axis=axis, window=win,
-                              padtype=padtype, cval=cval)
-        )
-
     g = math.gcd(up, down)
     up //= g
     down //= g
     xa = to_mlx(x)
     if up == down == 1:
-        return xa * 1  # scipy returns a copy
+        return xa * 1  # scipy returns a copy (before even validating padtype)
 
     n_in = xa.shape[axis]
     n_out = n_in * up
@@ -318,6 +418,42 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
         half_len = (h_np.size - 1) // 2
     h_np = h_np * up
 
+    # padtype is validated after axis and window, matching scipy's error order
+    stat_padtypes = ("mean", "median", "maximum", "minimum")
+    if padtype not in stat_padtypes and padtype not in _UPFIRDN_MODES:
+        raise ValueError(
+            "padtype must be one of: "
+            + ", ".join(sorted(stat_padtypes) + list(_UPFIRDN_MODES))
+        )
+
+    background = None
+    upfirdn_mode, upfirdn_cval = "constant", 0
+    if padtype in stat_padtypes:
+        # scipy subtracts a per-channel statistic, runs the zero-padded
+        # polyphase pass, and adds it back after the keep-slice. MLX's
+        # sort/min/max order complex64 like numpy (real part, then imaginary),
+        # so complex signals stay on-device too.
+        if padtype == "mean":
+            background = mx.mean(xa, axis=axis, keepdims=True)
+        elif padtype == "maximum":
+            background = mx.max(xa, axis=axis, keepdims=True)
+        elif padtype == "minimum":
+            background = mx.min(xa, axis=axis, keepdims=True)
+        else:  # median, like np.median: mean of the two middle order statistics
+            s = mx.sort(xa, axis=axis)
+            mid = mx.take(s, mx.array([n_in // 2]), axis=axis)
+            if n_in % 2 == 0:
+                mid = (mid + mx.take(s, mx.array([n_in // 2 - 1]), axis=axis)) / 2
+            if xa.dtype != mx.complex64:
+                # np.median propagates NaN (sorting alone hides it at the end)
+                any_nan = mx.any(mx.isnan(xa), axis=axis, keepdims=True)
+                mid = mx.where(any_nan, mx.array(np.nan, dtype=mid.dtype), mid)
+            background = mid
+        xa = xa - background
+    else:
+        upfirdn_mode = padtype
+        upfirdn_cval = 0 if cval is None else cval
+
     # zero-pad the filter so output samples land at the center
     n_pre_pad = down - half_len % down
     n_post_pad = 0
@@ -333,10 +469,11 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
     n_pre_remove_end = n_pre_remove + n_out
 
     h32 = h_full.astype(np.complex64 if np.iscomplexobj(h_full) else np.float32)
-    y = upfirdn(h32, xa, up, down, axis=axis)
+    y = upfirdn(h32, xa, up, down, axis=axis, mode=upfirdn_mode, cval=upfirdn_cval)
     keep = [slice(None)] * y.ndim
     keep[axis] = slice(n_pre_remove, n_pre_remove_end)
-    return y[tuple(keep)]
+    y = y[tuple(keep)]
+    return y + background if background is not None else y
 
 
 def decimate(x, q, n=None, ftype="iir", axis=-1, zero_phase=True):
