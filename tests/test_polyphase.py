@@ -24,6 +24,27 @@ UPFIRDN_CASES = [
 ]
 
 
+def _assert_nonfinite_components(got, expected, *, rtol=None):
+    """Compare NaN/Inf masks per component, then every finite value."""
+    got = np.asarray(got)
+    expected = np.asarray(expected)
+    parts = ((got.real, expected.real), (got.imag, expected.imag))
+    if not (np.iscomplexobj(got) or np.iscomplexobj(expected)):
+        parts = ((got, expected),)
+    for actual_part, expected_part in parts:
+        np.testing.assert_array_equal(np.isnan(actual_part), np.isnan(expected_part))
+        np.testing.assert_array_equal(np.isposinf(actual_part), np.isposinf(expected_part))
+        np.testing.assert_array_equal(np.isneginf(actual_part), np.isneginf(expected_part))
+        finite = np.isfinite(expected_part)
+        if rtol is None:
+            np.testing.assert_array_equal(actual_part[finite], expected_part[finite])
+        else:
+            scale = max(1.0, float(np.max(np.abs(expected_part[finite]), initial=0.0)))
+            np.testing.assert_allclose(
+                actual_part[finite], expected_part[finite], rtol=rtol, atol=rtol * scale
+            )
+
+
 @pytest.mark.parametrize("n,up,down,n_taps", UPFIRDN_CASES)
 def test_upfirdn_matches_scipy(rng, n, up, down, n_taps):
     x = rng.standard_normal(n).astype(np.float32)
@@ -110,7 +131,7 @@ def test_u32_route_bit_identical(rng, cx, ch, n, up, down, n_taps):
     complex_out = cx or ch
     xin = mx.view(x, mx.float32) if cx else x
     hin = mx.view(h, mx.float32) if ch else h
-    params = mx.array([n, n_out, up, down, n_taps], dtype=mx.int32)
+    params = mx.array([n, n_out, up, down, n_taps, 0], dtype=mx.int32)
     width = 2 * n_out if complex_out else n_out
 
     def launch(kern):
@@ -305,6 +326,187 @@ def test_upfirdn_complex_cval_raises_like_scipy(rng):
     h = rng.standard_normal(31).astype(np.float32)
     with pytest.raises(TypeError):
         msig.upfirdn(h, x, 2, 3, cval=1 + 2j)
+
+
+def test_upfirdn_none_cval_raises_like_scipy(rng):
+    x = rng.standard_normal(500).astype(np.float32)
+    h = rng.standard_normal(31).astype(np.float32)
+    with pytest.raises(TypeError):
+        msig.upfirdn(h, x, 2, 3, cval=None)
+
+
+@requires_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("mode", ["constant", "reflect"])
+@pytest.mark.parametrize(
+    "bad", [np.nan, np.inf, complex(np.nan, 1), complex(3, np.nan),
+            complex(np.inf, 1), complex(3, np.inf)],
+    ids=["real-nan", "real-inf", "complex-real-nan", "complex-imag-nan",
+         "complex-real-inf", "complex-imag-inf"],
+)
+def test_upfirdn_nonfinite_signal_matches_scipy_on_gpu(mode, bad):
+    """The padded polyphase branches and generic complex multiply preserve
+    scipy's local, component-wise exceptional-value masks on Metal."""
+    import warnings as _w
+
+    dtype = np.complex64 if isinstance(bad, complex) else np.float32
+    x = np.arange(80, dtype=np.float32).astype(dtype)
+    x[31] = bad
+    h = np.linspace(-1.0, 1.0, 17, dtype=np.float32)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", RuntimeWarning)
+        ref = sps.upfirdn(h, x, 3, 2, mode=mode)
+    with _w.catch_warnings():
+        _w.simplefilter("error", msig.FallbackWarning)
+        out = np.array(msig.upfirdn(h, x, 3, 2, mode=mode))
+    _assert_nonfinite_components(out, ref, rtol=2e-5)
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_upfirdn_antireflect_complex_infinite_edge_matches_scipy():
+    """Odd reflection is component-wise; generic complex arithmetic would add
+    spurious 0*Inf NaNs while constructing the boundary extension."""
+    import warnings as _w
+
+    x = np.array([-1.2221696 + 0.26735377j, complex(2, np.inf)], np.complex64)
+    h = np.array([-0.15171018, -0.08910976], np.float32)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", RuntimeWarning)
+        ref = sps.upfirdn(h, x, mode="antireflect")
+        out = np.array(msig.upfirdn(h, x, mode="antireflect"))
+    _assert_nonfinite_components(out, ref, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "bad", [np.nan, np.inf, complex(np.nan, 1), complex(3, np.inf)],
+    ids=["real-nan", "real-inf", "complex-nan", "complex-inf"],
+)
+def test_upfirdn_nonfinite_taps_fall_back_exact(bad):
+    """Non-finite taps interact with scipy's implicit signal extension; retain
+    the direct scipy loop rather than dropping its zero-times-nonfinite terms."""
+    import warnings as _w
+
+    dtype = np.complex64 if isinstance(bad, complex) else np.float32
+    h = np.arange(1, 18, dtype=np.float32).astype(dtype)
+    h[8] = bad
+    x = np.arange(80, dtype=np.float32)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", RuntimeWarning)
+        ref = sps.upfirdn(h, x, 3, 2)
+    with msig.config_context(dispatch="auto", gpu_min_size=0, warn_on_fallback=True):
+        with pytest.warns(msig.FallbackWarning, match="non-finite filter taps"):
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", RuntimeWarning)
+                out = np.array(msig.upfirdn(h, x, 3, 2))
+    _assert_nonfinite_components(out, ref)
+    if HAS_GPU:
+        with pytest.raises(NotImplementedError, match="non-finite filter taps"):
+            msig.upfirdn(h, x, 3, 2)
+
+
+def test_upfirdn_no_metal_nonfinite_fallback_is_route_invariant(monkeypatch):
+    """The exceptional CPU fallback must filter the same canonical f32 values
+    as an explicitly selected scipy route, not the original f64 operands."""
+    import mlx.core as mx
+
+    h = np.array([1.0, -1.0 + 1e-8], np.float64)
+    x = np.full(20, 1e8, np.float64)
+    x[10] = np.nan
+    monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    with msig.config_context(dispatch="scipy", warn_on_downcast=False):
+        scipy_route = np.array(msig.upfirdn(h, x))
+    with msig.config_context(
+        dispatch="auto", gpu_min_size=0, warn_on_downcast=False,
+        warn_on_fallback=False,
+    ):
+        fallback_route = np.array(msig.upfirdn(h, x))
+    _assert_nonfinite_components(fallback_route, scipy_route)
+
+
+@pytest.mark.parametrize("padtype", ["mean", "median", "maximum", "minimum"])
+@pytest.mark.parametrize(
+    "bad", [complex(np.nan, 1), complex(3, np.nan), complex(np.inf, 1),
+            complex(3, np.inf)],
+    ids=["nan-real", "nan-imag", "inf-real", "inf-imag"],
+)
+@pytest.mark.parametrize("container", ["numpy", "mlx"])
+def test_resample_poly_complex_nonfinite_stat_padtypes_fall_back_exact(
+    padtype, bad, container
+):
+    """SciPy's generic complex multiplication spreads either-component
+    non-finites across components; the split-plane GPU kernel must not serve
+    this exceptional parity corner."""
+    import warnings as _w
+
+    x = np.array(
+        [1 + 2j, 2 + 1j, bad, 4 - 1j, 5 + 0j], np.complex64
+    )
+    source = x
+    if container == "mlx":
+        import mlx.core as mx
+
+        source = mx.array(x)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", RuntimeWarning)
+        ref = sps.resample_poly(x, 3, 2, padtype=padtype)
+    with msig.config_context(dispatch="auto", gpu_min_size=0, warn_on_fallback=True):
+        with pytest.warns(msig.FallbackWarning, match="complex non-finite"):
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", RuntimeWarning)
+                out = np.array(msig.resample_poly(source, 3, 2, padtype=padtype))
+    _assert_nonfinite_components(out, ref)
+    if HAS_GPU:
+        with pytest.raises(NotImplementedError, match="complex non-finite"):
+            msig.resample_poly(source, 3, 2, padtype=padtype)
+
+
+@pytest.mark.parametrize(
+    "config", [
+        {"dispatch": "scipy"},
+        {"dispatch": "auto", "gpu_min_size": 10**9},
+    ],
+    ids=["explicit-scipy", "auto-small"],
+)
+@pytest.mark.parametrize("container", ["numpy", "mlx"])
+def test_resample_poly_complex_nonfinite_scipy_routes_stay_silent(config, container):
+    """A deliberate or size-based scipy route is not a capability fallback."""
+    import warnings as _w
+
+    x = np.array([1 + 2j, 2 + 1j, complex(3, np.nan), 4 - 1j], np.complex64)
+    source = x
+    if container == "mlx":
+        import mlx.core as mx
+
+        source = mx.array(x)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", RuntimeWarning)
+        ref = sps.resample_poly(x, 3, 2, padtype="mean")
+    with msig.config_context(**config, warn_on_fallback=True):
+        with _w.catch_warnings():
+            _w.simplefilter("error", msig.FallbackWarning)
+            _w.simplefilter("ignore", RuntimeWarning)
+            out = np.array(msig.resample_poly(source, 3, 2, padtype="mean"))
+    _assert_nonfinite_components(out, ref)
+
+
+@requires_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("padtype", ["constant", "reflect", "smooth", "wrap"])
+@pytest.mark.parametrize("bad", [complex(np.nan, 1), complex(3, np.inf)])
+def test_resample_poly_complex_nonfinite_extension_padtypes_on_gpu(padtype, bad):
+    """Non-statistical padtypes retain their on-device route and scipy masks."""
+    import warnings as _w
+
+    x = np.full(100, 1 + 2j, np.complex64)
+    x[50] = bad
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", RuntimeWarning)
+        ref = sps.resample_poly(x, 3, 2, padtype=padtype)
+    with _w.catch_warnings():
+        _w.simplefilter("error", msig.FallbackWarning)
+        out = np.array(msig.resample_poly(x, 3, 2, padtype=padtype))
+    _assert_nonfinite_components(out, ref, rtol=2e-4)
 
 
 def test_upfirdn_empty_input_nonzero_cval(rng):

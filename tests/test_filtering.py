@@ -77,9 +77,7 @@ def test_lfilter_iir_runs_without_fallback(rng):
         _w.simplefilter("error", msig.FallbackWarning)
         out = msig.lfilter(b, a, x)
     ref = sps.lfilter(b.astype(np.float32), a.astype(np.float32), x)
-    tol = 1e-6 if HAS_GPU else 0.0  # no-Metal route IS scipy on the same f32 inputs
-    np.testing.assert_allclose(np.array(out), ref, rtol=tol,
-                               atol=tol * max(np.abs(ref).max(), 1e-9))
+    _assert_tf(out, ref)
 
 
 def test_lfilter_iir_order_above_cap_falls_back(rng):
@@ -167,9 +165,7 @@ def test_filtfilt_iir_matches_scipy_f32(rng):
         _w.simplefilter("error", msig.FallbackWarning)
         out = msig.filtfilt(b, a, x)
     ref = sps.filtfilt(b.astype(np.float32), a.astype(np.float32), x)
-    tol = 1e-6 if HAS_GPU else 1e-4
-    np.testing.assert_allclose(np.array(out), ref, rtol=tol,
-                               atol=tol * max(np.abs(ref).max(), 1e-9))
+    _assert_tf(out, ref)
 
 
 def test_filtfilt_zero_phase_property(rng):
@@ -217,6 +213,21 @@ def _assert_tf(out, ref, tol=1e-6):
                                atol=tol * max(np.abs(np.asarray(ref)).max(), 1e-9))
 
 
+@pytest.mark.parametrize(
+    "dispatch", ["auto", "scipy"] + (["mlx"] if HAS_GPU else [])
+)
+def test_filtfilt_tf_first_order_all_dispatches(rng, dispatch):
+    """A one-state lfilter_zi may be a negative-stride singleton; every
+    shared filtfilt wrapper must still construct and run the initial state."""
+    b, a = sps.butter(1, 0.3)
+    b32, a32 = b.astype(np.float32), a.astype(np.float32)
+    x = rng.standard_normal((4, 68)).astype(np.float32)
+    ref = sps.filtfilt(b32, a32, x, axis=1, padlen=19)
+    with msig.config_context(dispatch=dispatch, warn_on_downcast=False):
+        out = msig.filtfilt(b, a, x, axis=1, padlen=19)
+    _assert_tf(out, ref)
+
+
 @pytest.mark.parametrize("a0_scale", [1.0, 2.5])
 @pytest.mark.parametrize("ba", _TF_FILTERS)
 def test_lfilter_tf_sequential_bitwise(rng, ba, a0_scale):
@@ -249,7 +260,10 @@ def test_lfilter_tf_scalar_b_and_a(rng):
     """Scalar (0-d) b with scalar a is a pure gain, like scipy — and must not
     crash under pinned MLX dispatch."""
     x = rng.standard_normal(1000).astype(np.float32)
-    ref = sps.lfilter(np.float32(3.0), np.float32(2.0), x)
+    # SciPy 1.11's FIR fast path cannot consume a 0-d ``b`` even though newer
+    # releases accept it.  Use the equivalent 1-D coefficients for the
+    # dependency-floor reference while keeping scalar inputs on our call.
+    ref = sps.lfilter(np.array([3.0], np.float32), np.array([2.0], np.float32), x)
     out = msig.lfilter(3.0, 2.0, x)
     np.testing.assert_allclose(np.array(out), ref, rtol=1e-6)
     if HAS_GPU:
@@ -424,10 +438,11 @@ def test_lfilter_tf_narrowband_stays_sequential_and_tracks_scipy(rng):
     b32, a32 = b.astype(np.float32), a.astype(np.float32)
     x = rng.standard_normal((40, 100_000)).astype(np.float32)
     ref = sps.lfilter(b32, a32, x)
-    out = np.array(msig.lfilter(b, a, x))
-    tol = 1e-5 if HAS_GPU else 0.0
-    np.testing.assert_allclose(out, ref, rtol=tol,
-                               atol=tol * max(np.abs(ref).max(), 1e-9))
+    # Older scipy builds do not contract the recurrence's multiply-adds.  The
+    # resulting drift is most visible for this deliberately long-lived filter
+    # (the Metal/FMA result is closer to the float64 ideal on the floor build).
+    tol = 1e-5 if _TF_EXACT else 5e-4
+    _assert_tf(msig.lfilter(b, a, x), ref, tol=tol)
 
 
 def test_lfilter_tf_auto_routing_is_filter_invariant(rng):
@@ -501,9 +516,7 @@ def test_filtfilt_tf_padtypes(rng, padtype):
     ref = sps.filtfilt(b32, a32, x, padtype=padtype)
     out = msig.filtfilt(*_TF_FILTERS[2], x, padtype=padtype)
     assert ref.shape == tuple(np.array(out).shape)
-    tol = 1e-6 if HAS_GPU else 1e-4
-    np.testing.assert_allclose(np.array(out), ref, rtol=tol,
-                               atol=tol * max(np.abs(ref).max(), 1e-9))
+    _assert_tf(out, ref)
 
 
 def test_filtfilt_tf_padlen_and_axis(rng):
@@ -511,9 +524,41 @@ def test_filtfilt_tf_padlen_and_axis(rng):
     x = rng.standard_normal((3000, 9)).astype(np.float32)
     ref = sps.filtfilt(b32, a32, x, axis=0, padlen=500)
     out = msig.filtfilt(*_TF_FILTERS[3], x, axis=0, padlen=500)
-    tol = 1e-6 if HAS_GPU else 1e-4
-    np.testing.assert_allclose(np.array(out), ref, rtol=tol,
-                               atol=tol * max(np.abs(ref).max(), 1e-9))
+    _assert_tf(out, ref)
+
+
+def _filtfilt_padlen_variant(kind, x, padlen, *, scipy):
+    """Exercise the three independent padding wrappers with f32 coefficients."""
+    if kind == "fir":
+        b = sps.firwin(9, 0.2).astype(np.float32)
+        fn = sps.filtfilt if scipy else msig.filtfilt
+        return fn(b, [1.0], x, padlen=padlen)
+    if kind == "tf":
+        b, a = _tf_f32(_TF_FILTERS[1])
+        fn = sps.filtfilt if scipy else msig.filtfilt
+        return fn(b, a, x, padlen=padlen)
+    sos = sps.butter(2, 0.2, output="sos").astype(np.float32)
+    fn = sps.sosfiltfilt if scipy else msig.sosfiltfilt
+    return fn(sos, x, padlen=padlen)
+
+
+@pytest.mark.parametrize("kind", ["fir", "tf", "sos"])
+@pytest.mark.parametrize("padlen", [2.5, "3"])
+def test_filtfilt_rejects_non_integral_positive_padlen(rng, kind, padlen):
+    x = rng.standard_normal(100).astype(np.float32)
+    with pytest.raises(TypeError):
+        _filtfilt_padlen_variant(kind, x, padlen, scipy=False)
+
+
+@pytest.mark.parametrize("kind", ["fir", "tf", "sos"])
+@pytest.mark.parametrize("padlen", [np.nan, np.int64(3)], ids=["nan-no-pad", "numpy-int"])
+def test_filtfilt_padlen_special_values_match_scipy(rng, kind, padlen):
+    """NaN follows scipy's no-padding branch; NumPy integers remain valid
+    slice bounds in the FIR, transfer-function, and SOS wrappers."""
+    x = rng.standard_normal(100).astype(np.float32)
+    ref = _filtfilt_padlen_variant(kind, x, padlen, scipy=True)
+    out = _filtfilt_padlen_variant(kind, x, padlen, scipy=False)
+    _assert_tf(out, ref, tol=2e-4)
 
 
 def test_filtfilt_tf_padlen_too_long(rng):

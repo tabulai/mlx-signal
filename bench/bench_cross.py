@@ -50,11 +50,29 @@ except ImportError:  # direct execution: python bench/bench_cross.py
 warnings.filterwarnings("ignore")
 
 HAVE = {}
+SKIP_REASONS = {}
 for _mod in ("torch", "torchaudio", "jax", "librosa", "soxr"):
     try:
         HAVE[_mod] = importlib.import_module(_mod)
-    except Exception:
+    except Exception as exc:
         HAVE[_mod] = None
+        SKIP_REASONS[_mod] = f"{type(exc).__name__}: {exc}"
+
+
+def _optional_attr(module_name, attr):
+    """Resolve lazy optional APIs without letting one backend abort the suite."""
+    module = HAVE[module_name]
+    if module is None:
+        return None
+    try:
+        return getattr(module, attr)
+    except Exception as exc:
+        SKIP_REASONS[f"{module_name}.{attr}"] = f"{type(exc).__name__}: {exc}"
+        return None
+
+
+LIBROSA_STFT = _optional_attr("librosa", "stft")
+LIBROSA_RESAMPLE = _optional_attr("librosa", "resample")
 
 torch = HAVE["torch"]
 MPS = bool(torch and torch.backends.mps.is_available())
@@ -170,14 +188,14 @@ def task_stft(rng):
             label = "CPU (multithread)" if devname == "cpu" else "MPS GPU"
             rows.append(Row("torch.stft", label, e2e, n1, devt, chk))
 
-    if HAVE["librosa"]:
-        librosa = HAVE["librosa"]
-
+    if LIBROSA_STFT is not None:
         def f():
-            return librosa.stft(x, n_fft=1024, hop_length=512, center=False)
+            return LIBROSA_STFT(x, n_fft=1024, hop_length=512, center=False)
 
         e2e, n1 = timed(f)
-        rows.append(Row("librosa.stft", "CPU (numpy)", e2e, n1, check=rel_err(f(), ref)))
+        rows.append(
+            Row("librosa.stft", "CPU (numpy)", e2e, n1, check=rel_err(f(), ref))
+        )
 
     if HAVE["jax"]:
         fn = jax.jit(lambda a: jss.stft(a, **kw)[2])
@@ -269,15 +287,19 @@ def task_resample(rng):
             label = "CPU (multithread)" if devname == "cpu" else "MPS GPU"
             rows.append(Row("torchaudio resample (width=6)", label, e2e, n1, devt, chk))
 
-    if HAVE["librosa"]:
-        librosa = HAVE["librosa"]
-
+    if LIBROSA_RESAMPLE is not None:
         def f():
-            return librosa.resample(x, orig_sr=48000, target_sr=44100, res_type="soxr_hq", axis=-1)
+            return LIBROSA_RESAMPLE(
+                x, orig_sr=48000, target_sr=44100, res_type="soxr_hq", axis=-1
+            )
 
         e2e, n1 = timed(f)
-        rows.append(Row("librosa.resample (soxr_hq)", "CPU (C)", e2e, n1,
-                        check=resample_quality(f(), ref)))
+        rows.append(
+            Row(
+                "librosa.resample (soxr_hq)", "CPU (C)", e2e, n1,
+                check=resample_quality(f(), ref),
+            )
+        )
 
     if HAVE["soxr"]:
         soxr = HAVE["soxr"]
@@ -370,11 +392,15 @@ def to_markdown(sections):
     if HAVE["soxr"]:
         vers.append(f"soxr {HAVE['soxr'].__version__}")
     hdr.append(", ".join(vers) + ".")
+    if SKIP_REASONS:
+        skipped = "; ".join(f"{name}: {reason}" for name, reason in SKIP_REASONS.items())
+        hdr.append(f"Skipped optional backends/capabilities: {skipped}.")
     hdr.append("")
     hdr.append("e2e = NumPy in / NumPy out; device = data resident on the accelerator. "
                "'vs scipy' verifies each output against the scipy reference "
                "(max relative error, or aligned multi-channel quality for resamplers). "
-               "Rows marked (1 run) exceeded the 3 s guard.")
+               "Median of 5 runs after 2 warmups; rows marked (1 run) exceeded "
+               "the 3 s guard.")
     lines = hdr
     for title, rows in sections:
         base = rows[0].e2e_ms
@@ -409,6 +435,10 @@ def main():
             print(f"  {r.impl:38s} {r.backend:18s} e2e {r.e2e_ms:9.2f} ms{dev}   [{r.check}]")
 
     md = to_markdown(sections)
+    if SKIP_REASONS:
+        print("\nSkipped optional backends/capabilities:")
+        for name, reason in SKIP_REASONS.items():
+            print(f"  {name}: {reason}")
     if args.out:
         import pathlib
 

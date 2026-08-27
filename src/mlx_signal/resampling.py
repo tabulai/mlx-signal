@@ -23,6 +23,9 @@ from .windows import _window_np
 __all__ = ["decimate", "resample", "resample_poly", "upfirdn"]
 
 
+_MLX_VERSION = tuple(int(part) for part in mx.__version__.split(".")[:2])
+
+
 def _freq_window(window, n_x: int) -> np.ndarray:
     """Resolve the frequency-domain window to 64-bit host values (fftfreq order).
 
@@ -176,6 +179,30 @@ def _output_len(len_h: int, in_len: int, up: int, down: int) -> int:
     return (((in_len - 1) * up + len_h) - 1) // down + 1
 
 
+def _has_nonfinite(source, converted: mx.array) -> bool:
+    """Whether an input contains NaN/Inf after canonicalization."""
+    if isinstance(source, np.ndarray):
+        dtype = np.complex64 if converted.dtype == mx.complex64 else np.float32
+        with np.errstate(over="ignore", invalid="ignore"):
+            canonical = np.asarray(source, dtype=dtype)
+        return not np.isfinite(canonical).all()
+    if converted.dtype != mx.complex64:
+        return bool(np.array(mx.any(~mx.isfinite(converted))))
+    return bool(
+        np.array(
+            mx.any(
+                ~mx.isfinite(mx.real(converted))
+                | ~mx.isfinite(mx.imag(converted))
+            )
+        )
+    )
+
+
+def _has_complex_nonfinite(source, converted: mx.array) -> bool:
+    """Whether a complex input contains NaN/Inf in either component."""
+    return converted.dtype == mx.complex64 and _has_nonfinite(source, converted)
+
+
 def _upfirdn_composed(x2: mx.array, h: mx.array, up: int, down: int) -> mx.array:
     """upfirdn via zero-stuff + FFT convolution + strided slice, in MLX ops.
 
@@ -230,8 +257,21 @@ def _extend_plane(x2: mx.array, L: int, R: int, mode: str, cval) -> mx.array:
         left = x2[:, 1:L + 1][:, ::-1]
         right = x2[:, n - R - 1:n - 1][:, ::-1]
         if mode == "antireflect":
-            left = 2 * x2[:, :1] - left
-            right = 2 * x2[:, -1:] - right
+            if x2.dtype == mx.complex64:
+                # NumPy/scipy apply the odd-reflection affine transform to the
+                # two stored components independently.  Expressing it as MLX
+                # complex arithmetic would introduce generic 0*Inf cross terms.
+                def _odd_reflect(edge, reflected):
+                    real = 2 * mx.real(edge) - mx.real(reflected)
+                    imag = 2 * mx.imag(edge) - mx.imag(reflected)
+                    packed = mx.stack([real, imag], axis=-1)
+                    return mx.view(packed, mx.complex64).reshape(real.shape)
+
+                left = _odd_reflect(x2[:, :1], left)
+                right = _odd_reflect(x2[:, -1:], right)
+            else:
+                left = 2 * x2[:, :1] - left
+                right = 2 * x2[:, -1:] - right
     elif mode == "wrap":
         left = x2[:, n - L:]
         right = x2[:, :R]
@@ -281,7 +321,7 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
     if mode not in _UPFIRDN_MODES:
         raise ValueError(f"Unknown mode: {mode}")
     # scipy's C-level double cast: complex (even 0j) raises TypeError
-    cval = 0.0 if cval is None else float(cval)
+    cval = float(cval)
 
     xa = to_mlx(x)
     n_in = xa.shape[axis]
@@ -294,7 +334,7 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
             import scipy.signal as sps
 
             return result_to_mlx(
-                sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down,
+                sps.upfirdn(to_numpy(ha), to_numpy(xa), up=up, down=down,
                             axis=axis, mode=mode, cval=cval)
             )
         # scipy returns zeros of the formula-implied output length (its
@@ -312,7 +352,31 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
         import scipy.signal as sps
 
         return result_to_mlx(
-            sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down, axis=axis,
+            sps.upfirdn(to_numpy(ha), to_numpy(xa), up=up, down=down, axis=axis,
+                        mode=mode, cval=cval)
+        )
+
+    if _has_nonfinite(h, ha):
+        # scipy multiplies non-finite taps by the implicit zero extension past
+        # each signal edge; the optimized kernel skips those mathematically-zero
+        # products.  Preserve scipy's exceptional NaN/Inf masks wholesale.
+        capability_fallback("upfirdn", "non-finite filter taps")
+        import scipy.signal as sps
+
+        return result_to_mlx(
+            sps.upfirdn(to_numpy(ha), to_numpy(xa), up=up, down=down, axis=axis,
+                        mode=mode, cval=cval)
+        )
+
+    if not mx.metal.is_available() and _has_nonfinite(x, xa):
+        # The CPU-composed fallback uses FFT convolution, where a single
+        # non-finite contaminates the whole transform.  scipy's direct
+        # polyphase loop has local, generic-complex propagation instead.
+        capability_fallback("upfirdn", "non-finite input without Metal")
+        import scipy.signal as sps
+
+        return result_to_mlx(
+            sps.upfirdn(to_numpy(ha), to_numpy(xa), up=up, down=down, axis=axis,
                         mode=mode, cval=cval)
         )
 
@@ -340,7 +404,7 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
                 import scipy.signal as sps
 
                 return result_to_mlx(
-                    sps.upfirdn(to_numpy(h), signal_np(x), up=up, down=down,
+                    sps.upfirdn(to_numpy(ha), to_numpy(xa), up=up, down=down,
                                 axis=axis, mode=mode, cval=cval)
                 )
 
@@ -426,35 +490,9 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
             + ", ".join(sorted(stat_padtypes) + list(_UPFIRDN_MODES))
         )
 
-    background = None
-    upfirdn_mode, upfirdn_cval = "constant", 0
-    if padtype in stat_padtypes:
-        # scipy subtracts a per-channel statistic, runs the zero-padded
-        # polyphase pass, and adds it back after the keep-slice. MLX's
-        # sort/min/max order complex64 like numpy (real part, then imaginary),
-        # so complex signals stay on-device too.
-        if padtype == "mean":
-            background = mx.mean(xa, axis=axis, keepdims=True)
-        elif padtype == "maximum":
-            background = mx.max(xa, axis=axis, keepdims=True)
-        elif padtype == "minimum":
-            background = mx.min(xa, axis=axis, keepdims=True)
-        else:  # median, like np.median: mean of the two middle order statistics
-            s = mx.sort(xa, axis=axis)
-            mid = mx.take(s, mx.array([n_in // 2]), axis=axis)
-            if n_in % 2 == 0:
-                mid = (mid + mx.take(s, mx.array([n_in // 2 - 1]), axis=axis)) / 2
-            if xa.dtype != mx.complex64:
-                # np.median propagates NaN (sorting alone hides it at the end)
-                any_nan = mx.any(mx.isnan(xa), axis=axis, keepdims=True)
-                mid = mx.where(any_nan, mx.array(np.nan, dtype=mid.dtype), mid)
-            background = mid
-        xa = xa - background
-    else:
-        upfirdn_mode = padtype
-        upfirdn_cval = 0 if cval is None else cval
-
-    # zero-pad the filter so output samples land at the center
+    # Zero-pad the filter so output samples land at the center.  Do this before
+    # the statistical-background branch so an exceptional SciPy fallback can
+    # honor the actual size/dispatch decision of the filtering work.
     n_pre_pad = down - half_len % down
     n_post_pad = 0
     n_pre_remove = (half_len + n_pre_pad) // down
@@ -467,6 +505,65 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
         np.zeros(n_post_pad, dtype=h_np.dtype),
     ])
     n_pre_remove_end = n_pre_remove + n_out
+    filter_n_out = _output_len(len(h_full), n_in, up, down)
+    batch = xa.size // n_in if n_in else 0
+    filter_work = batch * filter_n_out * max(1, len(h_full) // up)
+
+    background = None
+    upfirdn_mode, upfirdn_cval = "constant", 0
+    if padtype in stat_padtypes:
+        if _has_complex_nonfinite(x, xa):
+            if use_mlx(filter_work):
+                # scipy's generic complex multiply propagates a NaN in either
+                # component (including one created by infinity arithmetic) to
+                # both output components.  Although the Metal polyphase kernel
+                # does likewise, MLX's complex statistical reductions do not
+                # match every non-finite ordering corner, so retain scipy for
+                # the complete operation.
+                capability_fallback(
+                    "resample_poly",
+                    f"complex non-finite input with padtype={padtype!r}",
+                )
+            import scipy.signal as sps
+
+            win = window if isinstance(window, str | tuple) else to_numpy(window)
+            return result_to_mlx(
+                sps.resample_poly(
+                    to_numpy(xa), up, down, axis=axis, window=win,
+                    padtype=padtype, cval=cval,
+                )
+            )
+        # scipy subtracts a per-channel statistic, runs the zero-padded
+        # polyphase pass, and adds it back after the keep-slice. MLX's
+        # sort/min/max order complex64 like numpy (real part, then imaginary),
+        # so complex signals stay on-device too.
+        if padtype == "mean":
+            background = mx.mean(xa, axis=axis, keepdims=True)
+        elif padtype == "maximum":
+            background = mx.max(xa, axis=axis, keepdims=True)
+        elif padtype == "minimum":
+            background = mx.min(xa, axis=axis, keepdims=True)
+        else:  # median, like np.median: mean of the two middle order statistics
+            if xa.dtype == mx.complex64 and _MLX_VERSION < (0, 31):
+                # MLX 0.30 advertises complex sort but its Metal block-sort
+                # kernel is unavailable and aborts at evaluation time.
+                background = mx.array(
+                    np.median(to_numpy(xa), axis=axis, keepdims=True).astype(np.complex64)
+                )
+            else:
+                s = mx.sort(xa, axis=axis)
+                mid = mx.take(s, mx.array([n_in // 2]), axis=axis)
+                if n_in % 2 == 0:
+                    mid = (mid + mx.take(s, mx.array([n_in // 2 - 1]), axis=axis)) / 2
+                if xa.dtype != mx.complex64:
+                    # np.median propagates NaN (sorting alone hides it at the end)
+                    any_nan = mx.any(mx.isnan(xa), axis=axis, keepdims=True)
+                    mid = mx.where(any_nan, mx.array(np.nan, dtype=mid.dtype), mid)
+                background = mid
+        xa = xa - background
+    else:
+        upfirdn_mode = padtype
+        upfirdn_cval = 0 if cval is None else cval
 
     h32 = h_full.astype(np.complex64 if np.iscomplexobj(h_full) else np.float32)
     y = upfirdn(h32, xa, up, down, axis=axis, mode=upfirdn_mode, cval=upfirdn_cval)

@@ -1,4 +1,4 @@
-"""Benchmark mlx-signal against scipy.signal (and torchaudio, if installed).
+"""Benchmark mlx-signal against scipy.signal.
 
 Timing discipline:
 - MLX is lazy: every MLX timing closure ends in mx.eval(...) so the GPU work is
@@ -8,9 +8,10 @@ Timing discipline:
   transfer), "device" starts and ends with evaluated MLX arrays (steady-state
   pipelines that stay on-GPU, e.g. feeding an MLX model).
 - Median of `--repeat` runs after `--warmup` warmups.
+- Every case passes one untimed scipy-vs-MLX correctness gate before timing.
 
 Usage:
-    python bench/bench.py            # full matrix (~1-2 min)
+    python bench/bench.py            # full matrix (~2-3 min at defaults)
     python bench/bench.py --quick    # smaller matrix
     python bench/bench.py --out bench/results/results.md
 """
@@ -54,6 +55,53 @@ def _to_np_all(out):
     if isinstance(out, tuple):
         return tuple(np.array(o) if isinstance(o, mx.array) else o for o in out)
     return np.array(out)
+
+
+def _verify_all(out, ref, path="output", tol=2e-3):
+    """Recursively reject a benchmark case whose MLX result is not credible."""
+    if isinstance(ref, tuple):
+        if not isinstance(out, tuple) or len(out) != len(ref):
+            raise RuntimeError(f"verification failed at {path}: tuple structure differs")
+        for i, (got, expected) in enumerate(zip(out, ref, strict=True)):
+            _verify_all(got, expected, f"{path}[{i}]", tol)
+        return
+    if isinstance(ref, dict):
+        if not isinstance(out, dict) or out.keys() != ref.keys():
+            raise RuntimeError(f"verification failed at {path}: property keys differ")
+        for key in ref:
+            _verify_all(out[key], ref[key], f"{path}[{key!r}]", tol)
+        return
+
+    got = np.asarray(out)
+    expected = np.asarray(ref)
+    if got.shape != expected.shape:
+        raise RuntimeError(
+            f"verification failed at {path}: shape {got.shape} != {expected.shape}"
+        )
+    if expected.dtype.kind in "iub" or got.dtype.kind in "iub":
+        if not np.array_equal(got, expected):
+            raise RuntimeError(f"verification failed at {path}: discrete values differ")
+        return
+    if not np.all(np.isfinite(got)) or not np.all(np.isfinite(expected)):
+        raise RuntimeError(f"verification failed at {path}: non-finite values")
+    scale = max(float(np.max(np.abs(expected), initial=0.0)), 1e-30)
+    error = float(np.max(np.abs(got - expected), initial=0.0)) / scale
+    if error > tol:
+        raise RuntimeError(
+            f"verification failed at {path}: peak-scaled error {error:.2e} > {tol:.0e}"
+        )
+
+
+def _verify_case(name, out, ref):
+    if name == "istft":
+        # scipy returns a batch-length "time" vector for N-D ISTFT input; the
+        # library intentionally fixes that upstream bug (see istft's docstring).
+        # Validate the reconstructed signal and our corrected time-vector shape.
+        _verify_all(out[1], ref[1], path="istft signal")
+        expected_t = np.arange(np.asarray(out[1]).shape[-1], dtype=np.float32)
+        _verify_all(out[0], expected_t, path="istft time")
+        return
+    _verify_all(out, ref, path=name)
 
 
 class Case:
@@ -313,6 +361,11 @@ def run(quick: bool, warmup: int, repeat: int) -> list[dict]:
     rows = []
     with msig.config_context(dispatch="mlx", warn_on_downcast=False):
         for case in build_cases(quick):
+            ref = case.scipy_fn()
+            got = _to_np_all(case.mlx_fn())
+            _verify_case(case.name, got, ref)
+            del got, ref
+
             t_scipy = _median_time(case.scipy_fn, warmup, repeat)
 
             mlx_fn = case.mlx_fn
@@ -416,7 +469,7 @@ def _device_variant(case: Case, mx_inputs):
     return None
 
 
-def to_markdown(rows: list[dict]) -> str:
+def to_markdown(rows: list[dict], warmup: int, repeat: int) -> str:
     chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
                           capture_output=True, text=True).stdout.strip()
     import scipy
@@ -425,6 +478,8 @@ def to_markdown(rows: list[dict]) -> str:
         f"Benchmarks on {chip} (macOS {platform.mac_ver()[0]}), "
         f"mlx {mx.__version__}, scipy {scipy.__version__}, float32 inputs. "
         "e2e = NumPy in / NumPy out; device = MLX arrays in and out (steady state).",
+        f"Every output passed the scipy correctness gate before timing; median of {repeat} "
+        f"runs after {warmup} warmups.",
         "",
         "| function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) "
         "| speedup (e2e / device) |",
@@ -455,7 +510,7 @@ def main():
               "representative.")
 
     rows = run(args.quick, args.warmup, args.repeat)
-    md = to_markdown(rows)
+    md = to_markdown(rows, args.warmup, args.repeat)
     print("\n" + md)
     if args.out:
         import pathlib

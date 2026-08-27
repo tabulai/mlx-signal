@@ -45,18 +45,30 @@ def _local_maxima(x: np.ndarray, gpu_ok: bool = False):
         e = np.array([], dtype=np.intp)
         return e, e, e
     if gpu_ok and use_mlx(x.size) and mx.metal.is_available():
-        # exact when the source data is float32: the sign of an f32 subtraction
-        # of f32 values is always the true sign (Sterbenz)
+        # Compare directly.  Subtract-then-sign is not exact on Metal when two
+        # adjacent normal values differ by a subnormal ULP: the subtraction is
+        # flushed to zero even though the strict ordering is representable.
+        # Encode unordered NaN pairs as a non-sign sentinel so they break, not
+        # bridge, a possible rise-to-fall transition.
         xa = mx.array(x.astype(np.float32))
-        d = np.array(mx.sign(xa[1:] - xa[:-1])).astype(np.int8)
+        left, right = xa[:-1], xa[1:]
+        unordered = mx.isnan(left) | mx.isnan(right)
+        d = np.array(
+            mx.where(unordered, 2, mx.where(right > left, 1, mx.where(right < left, -1, 0)))
+        ).astype(np.int8)
     else:
-        d = np.sign(np.diff(x)).astype(np.int8)
+        left, right = x[:-1], x[1:]
+        unordered = np.isnan(left) | np.isnan(right)
+        d = np.where(
+            unordered, 2, np.where(right > left, 1, np.where(right < left, -1, 0))
+        )
+        d = d.astype(np.int8)
     nz = np.nonzero(d)[0]
     if nz.size < 2:
         e = np.array([], dtype=np.intp)
         return e, e, e
     s = d[nz]
-    trans = np.nonzero((s[:-1] > 0) & (s[1:] < 0))[0]
+    trans = np.nonzero((s[:-1] == 1) & (s[1:] == -1))[0]
     left_edges = (nz[trans] + 1).astype(np.intp)
     right_edges = nz[trans + 1].astype(np.intp)
     midpoints = (left_edges + right_edges) // 2
@@ -157,6 +169,21 @@ def _f32_source(x):
     return None
 
 
+def _has_f32_denormals(x64: np.ndarray) -> bool:
+    """Whether an exactly embedded float32 signal contains a denormal value.
+
+    Metal flushes float32 denormals during comparison, so these rare signals
+    retain scipy's CPU path.  Scan in chunks to keep temporaries cache-sized.
+    """
+    tiny = np.finfo(np.float32).tiny
+    step = 1 << 21
+    for start in range(0, x64.size, step):
+        a = np.abs(x64[start : start + step])
+        if bool(np.any((a > 0) & (a < tiny))):
+            return True
+    return False
+
+
 def _peaks_as_intp(peaks):
     """scipy's peaks canonicalization: same casts, same errors."""
     peaks = np.asarray(peaks)
@@ -201,12 +228,8 @@ def _prominences(x64, f32_src, peaks, wlen):
     # float32-denormal range; such signals keep scipy's exact CPU walk.
     # Chunked so the |x| temporaries stay cache-resident rather than making
     # three full-signal passes through DRAM.
-    tiny = np.finfo(np.float32).tiny
-    step = 1 << 21
-    for start in range(0, x64.size, step):
-        a = np.abs(x64[start:start + step])
-        if bool(np.any((a > 0) & (a < tiny))):
-            return sps.peak_prominences(x64, peaks, wlen=wlen)
+    if _has_f32_denormals(x64):
+        return sps.peak_prominences(x64, peaks, wlen=wlen)
 
     peaks_i = _peaks_as_intp(peaks)
     if peaks_i.size == 0:
@@ -223,7 +246,8 @@ def _prominences(x64, f32_src, peaks, wlen):
         # a reversed f32 view is ordinary numpy; mx.array refuses
         # negative-stride DLPack exports, so ensure contiguity (a no-op for
         # the common contiguous case — and only the values matter here)
-        x32 = mx.array(np.ascontiguousarray(f32_src))
+        src = f32_src.copy() if any(s < 0 for s in f32_src.strides) else f32_src
+        x32 = mx.array(np.ascontiguousarray(src))
     lb, rb = _peaks_metal.prominence_bases(x32, peaks_i)
     prominences = x64[peaks_i] - np.maximum(x64[lb], x64[rb])
     if np.any(prominences == 0):
@@ -288,6 +312,13 @@ def find_peaks(
         raise ValueError("`distance` must be greater or equal to 1")
 
     f32_src = _f32_source(orig)
+    if (
+        f32_src is not None
+        and mx.metal.is_available()
+        and use_mlx(x.size)
+        and _has_f32_denormals(x)
+    ):
+        f32_src = None
     peaks, left_edges, right_edges = _local_maxima(x, f32_src is not None)
     properties: dict[str, np.ndarray] = {}
 

@@ -73,6 +73,7 @@ _SRC = """
     int up     = params[2];
     int down   = params[3];
     int n_taps = params[4];
+    float czero = (float)params[5];
 
     threadgroup {HT} sh[{TILE}];
     long xbase = (long)b * {XW} * n_in;
@@ -129,6 +130,7 @@ _SRC_DIRECT = """
     int up     = params[2];
     int down   = params[3];
     int n_taps = params[4];
+    float czero = (float)params[5];
     if ((int)i >= n_out) return;
 
     long xbase = (long)b * {XW} * n_in;
@@ -168,6 +170,7 @@ _SRC_DIRECT_U32 = """
     int n_in   = params[0];
     int n_out  = params[1];
     int n_taps = params[4];
+    float czero = (float)params[5];
     if ((int)i >= n_out) return;
     uint up   = (uint)params[2];
     uint down = (uint)params[3];
@@ -212,10 +215,17 @@ def _kernel(cx: bool, ch: bool, direct: bool, u32: bool = False):
         if cx else "float xv = x[xbase + jj];"
     )
     hval = "hv" if (direct or u32) else "sh[k - tile]"
-    if cx and ch:
-        mult = f"cmul({hval}, xv)"
+    if complex_out:
+        # A real operand in a complex multiply still needs the generic complex
+        # formula.  In particular, scipy propagates ``NaN + finite*j`` across
+        # both components through the nominal 0*j cross terms; MSL's native
+        # float2*float operation does not.  Load the zero from ``params`` so
+        # fast-math cannot constant-fold ``nonfinite * 0`` away.
+        harg = hval if ch else f"float2({hval}, czero)"
+        xarg = "xv" if cx else "float2(xv, czero)"
+        mult = f"cmul({harg}, {xarg})"
     else:
-        # float2 * float (or float * float) is componentwise in MSL
+        # real taps times real signal
         mult = f"{hval} * xv"
     if complex_out:
         acct = "float2"
@@ -279,9 +289,22 @@ def upfirdn_gpu(x2d: mx.array, h: mx.array, up: int, down: int, n_out: int) -> m
     ch = h.dtype == mx.complex64
     complex_out = cx or ch
 
+    if n_taps % up:
+        # scipy's polyphase table pads every branch to equal length.  Those
+        # nominal zero taps are invisible for finite arithmetic, but 0*NaN/Inf
+        # is part of scipy's propagation contract.  Keep them in the Metal loop
+        # as scipy does.
+        padded_n_taps = n_taps + (-n_taps % up)
+        h = mx.concatenate(
+            [h, mx.zeros((padded_n_taps - n_taps,), dtype=h.dtype)]
+        )
+        n_taps = padded_n_taps
+
     xin = mx.view(x2d, mx.float32) if cx else x2d
     hin = mx.view(h, mx.float32) if ch else h
-    params = mx.array([n_in, n_out, up, down, n_taps], dtype=mx.int32)
+    # The final runtime zero preserves generic complex NaN/Inf propagation;
+    # see _kernel().
+    params = mx.array([n_in, n_out, up, down, n_taps, 0], dtype=mx.int32)
     width = 2 * n_out if complex_out else n_out
     xw = 2 if cx else 1
     stage_wins = (up == 1 and n_taps >= _STAGE_MIN_TAPS

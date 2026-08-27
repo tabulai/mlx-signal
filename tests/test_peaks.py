@@ -109,6 +109,27 @@ def test_large_signal_gpu_prefilter(rng):
     check_parity(x, prominence=0.5)
 
 
+def test_gpu_prefilter_preserves_tiny_normal_ordering():
+    """Adjacent normal float32 values can differ by a subnormal ULP; direct
+    comparisons must not flush that strict peak into a plateau."""
+    tiny = np.float32(np.finfo(np.float32).tiny)
+    above = np.nextafter(tiny, np.float32(np.inf))
+    check_parity(np.array([tiny, above, tiny], np.float32))
+
+
+def test_gpu_prefilter_denormal_signal_falls_back_exact():
+    tiny = np.float32(np.finfo(np.float32).smallest_subnormal)
+    check_parity(np.array([0.0, tiny, 0.0], np.float32))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_nan_gap_is_not_a_plateau_peak(dtype):
+    """Unordered pairs must break a rise/fall sequence; treating them as an
+    equality plateau incorrectly reports the NaN itself as a peak."""
+    x = np.array([0, 1, np.nan, 1, 0, 0, 2, 1], dtype=dtype)
+    check_parity(x)
+
+
 # ---------------------------------------------------------------------------
 # GPU prominence-base kernel (scipy-bit-exact; scipy fallback is trivially
 # exact, so every assertion here is array_equal on all routes)
@@ -174,6 +195,13 @@ def test_prominences_negative_stride_view(rng):
     route (mx.array refuses negative-stride DLPack exports)."""
     x = rng.standard_normal(1 << 17).astype(np.float32)[::-1]
     _assert_prom_equal(x)
+
+
+def test_prominences_negative_stride_singleton():
+    """Singleton views can advertise C-contiguity while retaining stride -4."""
+    _assert_prom_equal(
+        np.array([1.0], np.float32)[::-1], peaks=np.array([0], dtype=np.intp)
+    )
 
 
 def test_prominences_arbitrary_indices(rng):

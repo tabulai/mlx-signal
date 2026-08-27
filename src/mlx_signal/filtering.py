@@ -17,6 +17,7 @@ fall back to scipy with a :class:`~mlx_signal.FallbackWarning`.
 from __future__ import annotations
 
 import functools as _functools
+import operator as _operator
 
 import mlx.core as mx
 import numpy as np
@@ -554,7 +555,10 @@ def _filtfilt_tf(b_np, a_np, x, axis, padtype, padlen, method, irlen):
     elif padlen is None:
         edge = 3 * ntaps
     else:
-        edge = int(padlen)
+        # Keep scipy's validation semantics: integer-like values work as slice
+        # bounds, positive non-integers fail when the extension is built, and
+        # NaN/negative values take the no-padding path.
+        edge = padlen
 
     ax = axis % xa.ndim
     if xa.shape[ax] <= edge:
@@ -568,6 +572,7 @@ def _filtfilt_tf(b_np, a_np, x, axis, padtype, padlen, method, irlen):
         xa = mx.moveaxis(xa, ax, -1)
 
     if edge > 0:
+        edge = _operator.index(edge)
         ext_func = {"even": even_ext, "odd": odd_ext, "constant": const_ext}[padtype]
         ext = ext_func(xa, edge)
     else:
@@ -578,9 +583,12 @@ def _filtfilt_tf(b_np, a_np, x, axis, padtype, padlen, method, irlen):
     # scipy's f32 construction on the exact coefficients every route executes,
     # like sosfiltfilt: the direct scipy recurrence and the Metal kernels both
     # consume these state values
-    # ascontiguousarray: lfilter_zi can return a negative-stride view, which
-    # mx.array refuses through DLPack
-    zi_np = np.ascontiguousarray(_lfilter_zi(b_np, a_np), dtype=np.float32)  # (order,)
+    # lfilter_zi can return a negative-stride singleton that NumPy still flags
+    # as C-contiguous.  Force a copy because mx.array rejects negative-stride
+    # DLPack exports.
+    zi_np = np.array(
+        _lfilter_zi(b_np, a_np), dtype=np.float32, order="C", copy=True
+    )  # (order,)
     zi_shape = [1] * ext.ndim
     zi_shape[-1] = order
     zi_r = mx.array(zi_np).reshape(zi_shape)
@@ -638,7 +646,6 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
         padlen = 0
     elif padlen is None:
         padlen = 3 * max(1, ntaps)
-    padlen = int(padlen)
 
     xa = to_mlx(x)
     n = xa.shape[axis]
@@ -653,6 +660,7 @@ def filtfilt(b, a, x, axis=-1, padtype="odd", padlen=None, method="pad", irlen=N
         xa = mx.moveaxis(xa, axis, -1)
 
     if padlen > 0:
+        padlen = _operator.index(padlen)
         ext_func = {"even": even_ext, "odd": odd_ext, "constant": const_ext}[padtype]
         ext = ext_func(xa, padlen)
     else:
@@ -1004,7 +1012,7 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
     elif padlen is None:
         edge = ntaps * 3
     else:
-        edge = int(padlen)
+        edge = padlen
 
     ax = axis % xa.ndim
     if xa.shape[ax] <= edge:
@@ -1018,6 +1026,7 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
         xa = mx.moveaxis(xa, ax, -1)
 
     if edge > 0:
+        edge = _operator.index(edge)
         ext_func = {"even": even_ext, "odd": odd_ext, "constant": const_ext}[padtype]
         ext = ext_func(xa, edge)
     else:
