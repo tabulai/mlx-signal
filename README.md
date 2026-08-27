@@ -30,45 +30,47 @@ out (steady-state pipelines). Reproduce with `python bench/bench.py`.
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
 |---|---|---:|---:|---:|---:|
-| welch | 64ch × 2^20, nperseg=1024 | 493.73 ms | 9.69 ms | 4.36 ms | **50.9x / 113.3x** |
-| welch | 1ch × 2^22, nperseg=4096 | 48.08 ms | 2.01 ms | 0.61 ms | **23.9x / 79.4x** |
-| welch | 256ch × 2^16, nperseg=256 | 111.13 ms | 2.53 ms | 1.06 ms | **44.0x / 105.2x** |
-| csd | 64ch × 2^20, nperseg=1024 | 936.84 ms | 16.53 ms | 8.28 ms | **56.7x / 113.1x** |
-| coherence | 64ch × 2^20, nperseg=1024 | 1948.96 ms | 17.73 ms | 9.76 ms | **109.9x / 199.7x** |
-| spectrogram | 16ch × 2^20 | 66.81 ms | 3.57 ms | 1.25 ms | **18.7x / 53.6x** |
-| stft | 16ch × 2^20, nperseg=1024 | 79.78 ms | 4.75 ms | 1.22 ms | **16.8x / 65.2x** |
-| istft | 16ch × 2^20, nperseg=1024 | 178.28 ms | 21.19 ms | 2.63 ms | **8.4x / 67.9x** |
-| fftconvolve | 2^20 × 4097 | 10.93 ms | 1.61 ms | 1.40 ms | **6.8x / 7.8x** |
-| fftconvolve | 2^22 × 257 | 44.87 ms | 2.65 ms | 0.70 ms | **17.0x / 64.0x** |
-| fftconvolve (pair) | 2^20 × 2^20 | 20.13 ms | 2.63 ms | 0.94 ms | **7.7x / 21.5x** |
-| oaconvolve | 2^23 × 513 | 27.19 ms | 3.26 ms | 1.25 ms | **8.3x / 21.7x** |
-| correlate (batched) | 64ch × 2^18, 4096 taps | 63.66 ms | 6.99 ms | 4.59 ms | **9.1x / 13.9x** |
-| correlate (auto) | 2^20 autocorrelation | 20.26 ms | 1.96 ms | 0.60 ms | **10.3x / 33.8x** |
-| resample_poly | 16ch, 48k→44.1k (147/160) | 120.29 ms | 3.36 ms | 0.96 ms | **35.8x / 125.8x** |
-| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 295.15 ms | 4.34 ms | 2.30 ms | **68.0x / 128.3x** |
-| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 180.69 ms | 3.80 ms | 1.25 ms | **47.5x / 144.2x** |
-| resample (FFT) | 2^20 → 2^18 | 4.25 ms | 0.55 ms | 0.35 ms | **7.7x / 12.1x** |
-| hilbert | 2^20 | 9.89 ms | 1.10 ms | 0.81 ms | **9.0x / 12.2x** |
-| lfilter (FIR) | 64ch × 2^20, 257 taps | 1619.76 ms | 12.93 ms | 4.88 ms | **125.2x / 332.1x** |
-| lfilter (IIR) | 256ch × 2^20, butter-4 tf | 1551.14 ms | 43.71 ms | 12.43 ms | **35.5x / 124.8x** |
-| lfilter (IIR, single channel) | 1ch × 2^22, butter-4 tf | 23.31 ms | 1.39 ms | 0.95 ms | **16.7x / 24.5x** |
-| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1319.27 ms | 42.69 ms | 11.80 ms | **30.9x / 111.8x** |
-| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 20.84 ms | 1.76 ms | 1.35 ms | **11.8x / 15.4x** |
-| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2698.31 ms | 127.03 ms | 41.67 ms | **21.2x / 64.7x** |
-| filtfilt (IIR) | 256ch × 2^20, butter-4 tf | 3090.99 ms | 128.11 ms | 41.22 ms | **24.1x / 75.0x** |
-| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3236.10 ms | 35.12 ms | 13.74 ms | **92.1x / 235.6x** |
-| resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 66.45 ms | 6.44 ms | 5.61 ms | **10.3x / 11.8x** |
-| hilbert >1M samples¹ | 2^23 | 102.26 ms | 8.57 ms | 6.43 ms | **11.9x / 15.9x** |
-| find_peaks | 2^23, prominence=1 | 224.22 ms | 223.08 ms | — | 1.0x² |
+| welch | 64ch × 2^20, nperseg=1024 | 479.37 ms | 10.45 ms | 4.87 ms | **45.9x / 98.4x** |
+| welch | 1ch × 2^22, nperseg=4096 | 47.57 ms | 1.86 ms | 1.58 ms | **25.5x / 30.2x** |
+| welch | 256ch × 2^16, nperseg=256 | 110.27 ms | 5.20 ms | 1.06 ms | **21.2x / 104.4x** |
+| csd | 64ch × 2^20, nperseg=1024 | 921.74 ms | 15.98 ms | 8.05 ms | **57.7x / 114.4x** |
+| coherence | 64ch × 2^20, nperseg=1024 | 1896.76 ms | 17.55 ms | 9.64 ms | **108.1x / 196.8x** |
+| spectrogram | 16ch × 2^20 | 66.66 ms | 3.69 ms | 1.27 ms | **18.0x / 52.6x** |
+| stft | 16ch × 2^20, nperseg=1024 | 78.39 ms | 4.84 ms | 1.24 ms | **16.2x / 63.3x** |
+| istft | 16ch × 2^20, nperseg=1024 | 174.01 ms | 21.28 ms | 2.92 ms | **8.2x / 59.5x** |
+| fftconvolve | 2^20 × 4097 | 10.97 ms | 1.56 ms | 1.40 ms | **7.0x / 7.8x** |
+| fftconvolve | 2^22 × 257 | 44.16 ms | 2.70 ms | 2.17 ms | **16.3x / 20.3x** |
+| fftconvolve (pair) | 2^20 × 2^20 | 21.28 ms | 2.67 ms | 0.98 ms | **8.0x / 21.7x** |
+| oaconvolve | 2^23 × 513 | 26.56 ms | 4.61 ms | 1.26 ms | **5.8x / 21.1x** |
+| correlate (batched) | 64ch × 2^18, 4096 taps | 63.46 ms | 7.07 ms | 4.54 ms | **9.0x / 14.0x** |
+| correlate (auto) | 2^20 autocorrelation | 20.89 ms | 2.00 ms | 1.76 ms | **10.4x / 11.9x** |
+| resample_poly | 16ch, 48k→44.1k (147/160) | 119.99 ms | 5.56 ms | 0.97 ms | **21.6x / 124.0x** |
+| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 294.46 ms | 4.36 ms | 2.31 ms | **67.6x / 127.7x** |
+| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 180.26 ms | 3.88 ms | 1.27 ms | **46.4x / 142.5x** |
+| resample (FFT) | 2^20 → 2^18 | 4.19 ms | 0.43 ms | 0.36 ms | **9.7x / 11.7x** |
+| hilbert | 2^20 | 9.07 ms | 1.60 ms | 1.31 ms | **5.7x / 6.9x** |
+| lfilter (FIR) | 64ch × 2^20, 257 taps | 1591.15 ms | 12.92 ms | 4.86 ms | **123.2x / 327.7x** |
+| lfilter (IIR) | 256ch × 2^20, butter-4 tf | 1504.03 ms | 42.34 ms | 11.86 ms | **35.5x / 126.8x** |
+| lfilter (IIR, single channel) | 1ch × 2^22, butter-4 tf | 22.60 ms | 3.32 ms | 0.92 ms | **6.8x / 24.5x** |
+| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1288.13 ms | 42.15 ms | 11.76 ms | **30.6x / 109.6x** |
+| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 20.28 ms | 2.40 ms | 1.86 ms | **8.4x / 10.9x** |
+| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2646.82 ms | 130.12 ms | 39.98 ms | **20.3x / 66.2x** |
+| filtfilt (IIR) | 256ch × 2^20, butter-4 tf | 2987.04 ms | 131.07 ms | 40.14 ms | **22.8x / 74.4x** |
+| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3210.78 ms | 34.32 ms | 13.54 ms | **93.6x / 237.1x** |
+| resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 65.87 ms | 6.10 ms | 5.30 ms | **10.8x / 12.4x** |
+| hilbert >1M samples¹ | 2^23 | 98.73 ms | 8.25 ms | 6.10 ms | **12.0x / 16.2x** |
+| find_peaks | 2^23, prominence=1 | 215.09 ms | 80.15 ms | — | **2.7x**² |
+| peak_prominences | 2^23, 2.8M peaks | 155.08 ms | 19.46 ms | — | **8.0x**² |
 
 ¹ MLX 0.32's Metal FFT is broken above 2^20 (see *Known limitations*); mlx-signal
 runs those transform lengths through its own four-step (Bailey) decomposition —
 two batched safe-size sub-FFTs plus a twiddle multiply — entirely on the GPU.
 Only lengths with no safe factorization (e.g. large primes) fall back to a
 CPU-stream FFT.
-² `find_peaks` is bandwidth-bound index bookkeeping — the wrong shape for a GPU.
-It is included for pipeline completeness (GPU sign-diff prefilter, host refinement)
-and priced honestly at ~1x.
+² `find_peaks`' prominence stage — scipy's dominant cost, a sequential walk
+from every peak — runs on the GPU (one thread per peak with block-skip aux,
+bit-identical to scipy); the remaining index bookkeeping is host-side by
+design, which caps the end-to-end win near ~2.7x.
 
 ## How it compares beyond scipy
 
@@ -137,7 +139,7 @@ python -m pytest -q         # full golden suite against scipy and NumPy
 | convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; pow2-padded FFTs; long×short convolutions auto-block, and filters ≤1025 taps run a fused kernel pair (block FFT, spectrum multiply, inverse FFT in threadgroup memory) reassembled by gather-OLA; `fftconvolve(x, x)` and `correlate(x, x)` skip the second forward transform |
 | resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, polyphase geometry in 32-bit arithmetic whenever indices fit (Apple GPUs emulate 64-bit divides — worth ~4x at high `up`), taps staged through threadgroup memory only where measured to pay (pure decimation with a wide gather stride), complex-native — an IQ stream is one launch |
 | filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR, SOS-IIR, and transfer-function-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up; tf form to order 16 with native `zi`/`zf`) with scipy-exact edge handling; design host-side |
-| peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; host-side by design |
+| peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; prominence base-search on GPU for f32 sources (one thread per peak, two-level block-skip scan), index bookkeeping host-side |
 | utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
 
 **IIR runs on the GPU — even single-channel.** `sosfilt`/`sosfiltfilt` (and
@@ -220,8 +222,9 @@ them, so bit-identity claims for the IIR kernels hold for normal-range data.
   (`_fft_core.py`). When MLX
   fixes this, relaxing one predicate retires the workaround. (Worth reporting
   upstream to `ml-explore/mlx` if you can reproduce it.)
-- Windows/filter design (`get_window`, `firwin*`) and `find_peaks` refinement run
-  host-side — tiny work, and it keeps exact scipy parity.
+- Windows/filter design (`get_window`, `firwin*`) and `find_peaks`' index
+  refinement run host-side — tiny work, and it keeps exact scipy parity
+  (the prominence base-search itself runs on the GPU for f32 sources).
 - `lfilter`/`sosfilt` take and return `zi`/`zf` state natively on the GPU for
   IIR filters; FIR `lfilter` with `zi` follows scipy's convolution path on the
   CPU (falls back, warns).

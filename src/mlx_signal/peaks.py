@@ -1,19 +1,23 @@
-"""Peak finding: GPU-prefiltered local-maxima scan + host-side refinement.
+"""Peak finding: GPU local-maxima prefilter + prominence scan, host refinement.
 
-find_peaks is bandwidth-bound index bookkeeping, not FLOPs — the wrong shape
-for a GPU win. It is included for pipeline completeness: the elementwise
-difference/sign pass runs in MLX, and the index logic (plateau resolution,
-distance/prominence/width filtering) runs vectorized on the host, matching
-scipy.signal.find_peaks results exactly.
+The prominence stage — scipy's dominant cost in ``find_peaks(prominence=...)``
+(75% of its runtime: a sequential Cython walk from every peak) — runs on the
+GPU through a per-peak two-level block-skip Metal kernel (``_peaks_metal``)
+for float32 sources, bit-identical to scipy. The remaining index logic
+(plateau resolution, distance/width filtering) is bandwidth-bound bookkeeping
+and runs vectorized on the host, matching scipy.signal results exactly.
 
 Unlike the rest of the library, peak indices and properties are returned as
 NumPy arrays: they are host-side metadata (indices into your signal), not GPU
-tensors.
+tensors. Routing here is quiet by design (no capability fallbacks): scipy is
+the reference implementation and always available, the GPU path is an exact
+accelerator for the case that dominates in practice.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -114,19 +118,121 @@ def _select_by_peak_distance(peaks, priority, distance):
     return keep
 
 
-def peak_prominences(x, peaks, wlen=None):
-    """Prominence of each peak (scipy.signal.peak_prominences; host-side)."""
+def _f32_source(x):
+    """The 1-D float32 array behind ``x`` when the GPU exactness precondition
+    holds (float32 values embed exactly in the float64 scipy computes with),
+    else None."""
+    if isinstance(x, mx.array) and x.dtype == mx.float32 and x.ndim == 1:
+        return x
+    if isinstance(x, np.ndarray) and x.dtype == np.float32 and x.ndim == 1:
+        return x
+    return None
+
+
+def _peaks_as_intp(peaks):
+    """scipy's peaks canonicalization: same casts, same errors."""
+    peaks = np.asarray(peaks)
+    if peaks.size == 0:
+        peaks = np.array([], dtype=np.intp)
+    try:
+        peaks = peaks.astype(np.intp, casting="safe")
+    except TypeError as e:
+        raise TypeError("cannot safely cast `peaks` to dtype('intp')") from e
+    if peaks.ndim != 1:
+        raise ValueError("`peaks` must be a 1-D array")
+    return peaks
+
+
+def _prominences(x64, f32_src, peaks, wlen):
+    """(prominences, left_bases, right_bases), scipy-exact on every route.
+
+    GPU route (float32 source, no wlen, Metal, above the size threshold): the
+    kernel finds base indices with float32 comparisons — each predicate
+    decides identically to scipy's float64 walk because f32 embeds exactly in
+    f64 — and the prominences are one vectorized float64 subtraction, so the
+    triple bit-matches scipy. Everything else delegates to scipy. The
+    zero-prominence warning carries the same class and message on both
+    routes; only its frame attribution differs (the GPU route warns from the
+    caller's frame like scipy-direct, the delegation from this module).
+    """
     import scipy.signal as sps
 
-    return sps.peak_prominences(_as_1d_f64(x), np.asarray(peaks), wlen=wlen)
+    from . import _peaks_metal
+
+    if (
+        f32_src is None
+        or wlen is not None
+        or not mx.metal.is_available()
+        or not use_mlx(x64.size)
+        or x64.size >= _peaks_metal.MAX_N
+    ):
+        return sps.peak_prominences(x64, peaks, wlen=wlen)
+
+    # Metal compares denormals as zero (measured: 1e-40 == 0.0 is true
+    # on-GPU), which would corrupt base decisions in a signal scaled into the
+    # float32-denormal range; such signals keep scipy's exact CPU walk.
+    # Chunked so the |x| temporaries stay cache-resident rather than making
+    # three full-signal passes through DRAM.
+    tiny = np.finfo(np.float32).tiny
+    step = 1 << 21
+    for start in range(0, x64.size, step):
+        a = np.abs(x64[start:start + step])
+        if bool(np.any((a > 0) & (a < tiny))):
+            return sps.peak_prominences(x64, peaks, wlen=wlen)
+
+    peaks_i = _peaks_as_intp(peaks)
+    if peaks_i.size == 0:
+        return (np.array([], dtype=np.float64), np.array([], dtype=np.intp),
+                np.array([], dtype=np.intp))
+    invalid = (peaks_i < 0) | (peaks_i >= x64.size)
+    if invalid.any():
+        first = peaks_i[int(np.flatnonzero(invalid)[0])]
+        raise ValueError(f"peak {first} is not a valid index for `x`")
+
+    if isinstance(f32_src, mx.array):
+        x32 = f32_src
+    else:
+        # a reversed f32 view is ordinary numpy; mx.array refuses
+        # negative-stride DLPack exports, so ensure contiguity (a no-op for
+        # the common contiguous case — and only the values matter here)
+        x32 = mx.array(np.ascontiguousarray(f32_src))
+    lb, rb = _peaks_metal.prominence_bases(x32, peaks_i)
+    prominences = x64[peaks_i] - np.maximum(x64[lb], x64[rb])
+    if np.any(prominences == 0):
+        try:  # scipy keeps the class in a private module (subclasses RuntimeWarning)
+            from scipy.signal._peak_finding_utils import PeakPropertyWarning
+        except ImportError:  # pragma: no cover - future scipy reorganization
+            PeakPropertyWarning = RuntimeWarning
+        warnings.warn("some peaks have a prominence of 0",
+                      PeakPropertyWarning, stacklevel=3)
+    return prominences, lb, rb
+
+
+def peak_prominences(x, peaks, wlen=None):
+    """Prominence of each peak (scipy.signal.peak_prominences, bit-exact).
+
+    For float32 sources the base search runs on the GPU (one thread per peak,
+    two-level block skipping for the heavy-tailed scan lengths); ``wlen`` and
+    other dtypes delegate to scipy.
+    """
+    x64 = _as_1d_f64(x)
+    return _prominences(x64, _f32_source(x), np.asarray(peaks), wlen)
 
 
 def peak_widths(x, peaks, rel_height=0.5, prominence_data=None, wlen=None):
-    """Width of each peak (scipy.signal.peak_widths; host-side)."""
+    """Width of each peak (scipy.signal.peak_widths; host-side interpolation).
+
+    When ``prominence_data`` is not supplied it is computed first — on the GPU
+    for float32 sources — and handed to scipy, which then only does the
+    per-peak width interpolation.
+    """
     import scipy.signal as sps
 
+    x64 = _as_1d_f64(x)
+    if prominence_data is None:
+        prominence_data = _prominences(x64, _f32_source(x), np.asarray(peaks), wlen)
     return sps.peak_widths(
-        _as_1d_f64(x), np.asarray(peaks), rel_height=rel_height,
+        x64, np.asarray(peaks), rel_height=rel_height,
         prominence_data=prominence_data, wlen=wlen,
     )
 
@@ -153,10 +259,8 @@ def find_peaks(
     if distance is not None and distance < 1:
         raise ValueError("`distance` must be greater or equal to 1")
 
-    gpu_ok = (isinstance(orig, mx.array) and orig.dtype == mx.float32) or (
-        isinstance(orig, np.ndarray) and orig.dtype == np.float32
-    )
-    peaks, left_edges, right_edges = _local_maxima(x, gpu_ok)
+    f32_src = _f32_source(orig)
+    peaks, left_edges, right_edges = _local_maxima(x, f32_src is not None)
     properties: dict[str, np.ndarray] = {}
 
     if plateau_size is not None:
@@ -193,12 +297,10 @@ def find_peaks(
         properties = {key: array[keep] for key, array in properties.items()}
 
     if prominence is not None or width is not None:
-        import scipy.signal as sps
-
         properties.update(
             zip(
                 ["prominences", "left_bases", "right_bases"],
-                sps.peak_prominences(x, peaks, wlen=wlen),
+                _prominences(x, f32_src, peaks, wlen),
                 strict=True,
             )
         )

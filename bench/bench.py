@@ -290,12 +290,19 @@ def build_cases(quick: bool) -> list[Case]:
         (x,),
     ))
 
-    # --- peaks (honesty check: expected ~1x) --------------------------------
+    # --- peaks (prominence base-scan on GPU; index bookkeeping host-side) ---
     x = sig(1 << 23) if not quick else sig(1 << 20)
     cases.append(Case(
         "find_peaks", f"2^{int(np.log2(x.size))}, prominence=1",
         lambda x=x: sps.find_peaks(x, prominence=1.0),
         lambda x=x: msig.find_peaks(x, prominence=1.0),
+        (x,),
+    ))
+    pk_all = sps.find_peaks(np.asarray(x, dtype=np.float64))[0]
+    cases.append(Case(
+        "peak_prominences", f"2^{int(np.log2(x.size))}, {pk_all.size / 1e6:.1f}M peaks",
+        lambda x=x, p=pk_all: sps.peak_prominences(x, p),
+        lambda x=x, p=pk_all: msig.peak_prominences(x, p),
         (x,),
     ))
 
@@ -404,8 +411,8 @@ def _device_variant(case: Case, mx_inputs):
 
         b_tf, a_tf = _sps.butter(4, 0.25)
         return lambda: msig.filtfilt(b_tf, a_tf, a[0], axis=-1)
-    if n == "find_peaks":
-        return None  # host-side by design
+    if n in ("find_peaks", "peak_prominences"):
+        return None  # peak indices are host-side metadata by design
     return None
 
 
