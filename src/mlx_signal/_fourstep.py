@@ -157,6 +157,24 @@ def ifft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     return mx.moveaxis(out, -1, axis) if axis not in (-1, out.ndim - 1) else out
 
 
+def _rfft_untangle(Z, zmk, w):
+    """Packed-spectrum untangle: one fused elementwise pass over Z/Z[-k].
+
+    Uncompiled, each of these ~6 primitives is its own kernel launch
+    materializing a full-size intermediate (~550 MB of traffic at 2^23);
+    compiled they fuse into a single pass. The flip that builds ``zmk``
+    stays OUTSIDE the compiled graph and arrives as an input.
+    """
+    ze = 0.5 * (Z + mx.conj(zmk))
+    zo = 0.5 * (Z - mx.conj(zmk))
+    Xk = ze - mx.array(1j) * (w * zo)  # k = 0..m-1
+    nyq = (mx.real(Z[..., :1]) - mx.imag(Z[..., :1])).astype(mx.complex64)
+    return Xk, nyq
+
+
+_rfft_untangle_fused = mx.compile(_rfft_untangle)
+
+
 def rfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     """rfft of real ``a`` at length n. Even n uses the packed half-size trick."""
     if n % 2 or not _splittable(n // 2):
@@ -173,11 +191,7 @@ def rfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     z = mx.view(x, mx.complex64)  # z[t] = x[2t] + i*x[2t+1], shape (..., m)
     Z = _fft_4step_last(z)
     zmk = mx.concatenate([Z[..., :1], Z[..., 1:][..., ::-1]], axis=-1)  # Z[(m-k) % m]
-    ze = 0.5 * (Z + mx.conj(zmk))
-    zo = 0.5 * (Z - mx.conj(zmk))
-    w = _half_twiddle(m)
-    Xk = ze - mx.array(1j) * (w * zo)  # k = 0..m-1
-    nyq = (mx.real(Z[..., :1]) - mx.imag(Z[..., :1])).astype(mx.complex64)
+    Xk, nyq = _rfft_untangle_fused(Z, zmk, _half_twiddle(m))
     out = mx.concatenate([Xk, nyq], axis=-1)
     return mx.moveaxis(out, -1, axis) if axis not in (-1, out.ndim - 1) else out
 
@@ -308,6 +322,18 @@ def rfft_autocorr(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     return mx.moveaxis(out, -1, axis) if axis not in (-1, out.ndim - 1) else out
 
 
+def _irfft_pretwist(Xk, xflip, w):
+    """Inverse of the untangle: build the packed ifft input in one fused pass
+    (the flip arrives as an input, like ``_rfft_untangle``)."""
+    xmk = mx.conj(xflip)
+    E = 0.5 * (Xk + xmk)
+    wO = 0.5 * (Xk - xmk)
+    return E + mx.array(1j) * (wO * mx.conj(w))
+
+
+_irfft_pretwist_fused = mx.compile(_irfft_pretwist)
+
+
 def irfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
     """irfft of the one-sided spectrum ``a`` to a length-n real signal."""
     if n % 2 or not _splittable(n // 2):
@@ -334,10 +360,12 @@ def irfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
         axis=-1,
     )
     Xk = X[..., :m]
-    xmk = mx.conj(X[..., 1:][..., ::-1])  # conj(X[m-k]) for k = 0..m-1
-    E = 0.5 * (Xk + xmk)
-    wO = 0.5 * (Xk - xmk)
-    O = wO * mx.conj(_half_twiddle(m))
-    z = _ifft_4step_last(E + mx.array(1j) * O)
-    out = mx.stack([mx.real(z), mx.imag(z)], axis=-1).reshape(z.shape[:-1] + (n,))
+    xflip = X[..., 1:][..., ::-1]  # X[m-k] for k = 0..m-1; flip outside compile
+    z = _ifft_4step_last(_irfft_pretwist_fused(Xk, xflip, _half_twiddle(m)))
+    if hasattr(mx, "view"):
+        # free reinterpretation: complex (..., m) is already the interleaved
+        # (..., n) float32 samples (same pattern as rfft_conv_pair)
+        out = mx.view(z, mx.float32)
+    else:
+        out = mx.stack([mx.real(z), mx.imag(z)], axis=-1).reshape(z.shape[:-1] + (n,))
     return mx.moveaxis(out, -1, axis) if axis not in (-1, out.ndim - 1) else out
