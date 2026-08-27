@@ -360,7 +360,9 @@ def irfft_large(a: mx.array, n: int, axis: int = -1) -> mx.array | None:
         axis=-1,
     )
     Xk = X[..., :m]
-    xflip = X[..., 1:][..., ::-1]  # X[m-k] for k = 0..m-1; flip outside compile
+    # MLX 0.31 miscompiles a negative-stride input to ``mx.compile``.  Keep
+    # the flip outside the compiled graph, but materialize it before fusion.
+    xflip = mx.contiguous(X[..., 1:][..., ::-1])  # X[m-k] for k = 0..m-1
     z = _ifft_4step_last(_irfft_pretwist_fused(Xk, xflip, _half_twiddle(m)))
     if hasattr(mx, "view"):
         # free reinterpretation: complex (..., m) is already the interleaved
