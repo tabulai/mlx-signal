@@ -1,33 +1,48 @@
 # mlx-signal
 
-**Metal/MLX-accelerated signal processing for Apple Silicon, mirroring `scipy.signal`.**
+**GPU-accelerated signal processing for Apple Silicon, with familiar
+`scipy.signal` APIs.**
 
-`scipy.signal` runs every `welch()`, `resample_poly()`, and `lfilter()` call on a
-single performance core — NumPy/SciPy only link Apple's Accelerate for BLAS/LAPACK,
-which signal processing never touches. On an M-series GPU those same workloads are
-thousands of independent FFTs and dot products. mlx-signal keeps the scipy API and
-moves the math to the GPU through [MLX](https://github.com/ml-explore/mlx):
+mlx-signal implements a practical subset of `scipy.signal` with
+[MLX](https://github.com/ml-explore/mlx) and custom Metal kernels. It accepts
+NumPy or MLX arrays and returns MLX arrays in Apple's unified memory.
 
 ```python
 import numpy as np
-import mlx_signal as sig   # scipy.signal signatures (implemented subset below)
+import mlx_signal as sig
 
-x = np.random.randn(64, 1 << 20).astype(np.float32)   # 64-channel recording
-f, Pxx = sig.welch(x, fs=48_000, nperseg=1024)         # one batched GPU FFT
-Pxx_np = np.array(Pxx)                                 # unified memory: cheap
+x = np.random.randn(64, 1 << 20).astype(np.float32)
+frequencies, power = sig.welch(x, fs=48_000, nperseg=1024)
+power_np = np.array(power)
 ```
 
-Inputs can be NumPy or MLX arrays; outputs are MLX arrays in **unified memory**, so
-`np.array(result)` costs a copy within the same RAM — and an audio/RF preprocessing
-chain can feed an MLX model with **zero host-device transfers**, which neither scipy
-nor torchaudio-on-MPS (with its silent CPU fallback bouncing) offers.
+MLX pipelines can pass results straight into a model without a host-device
+transfer. NumPy users get the same API and can convert the result with a normal
+in-memory copy. Small jobs automatically stay on SciPy when a GPU launch would
+cost more than it saves.
+
+## Install
+
+Requires Apple Silicon, macOS 13.5 or newer, and Python 3.10 or newer. Until the
+planned 0.1.0 PyPI release, install from a checkout:
+
+```bash
+git clone https://github.com/tabulai/mlx-signal
+cd mlx-signal
+pip install -e .            # or: uv pip install -e .
+python -m pytest -q         # optional: run the SciPy parity suite
+```
 
 ## Measured performance
 
-Apple M4 Max (macOS 26.2), mlx 0.32.2, scipy 1.18.1, float32. Every output
-passed a scipy correctness gate; timings are medians of 9 runs after 3 warmups.
-*e2e* = NumPy in / NumPy out (the drop-in experience). *device* = MLX arrays in and
-out (steady-state pipelines). Reproduce with
+Measured on an Apple M4 Max (macOS 26.2) with MLX 0.32.2, SciPy 1.18.1, and
+float32 data. Every result passed a SciPy correctness check before timing.
+Values are medians of 9 runs after 3 warmups:
+
+- **e2e:** NumPy input and output, for drop-in use
+- **device:** MLX input and output, for an on-device pipeline
+
+See the [full report](bench/results/results.md), or reproduce it with
 `python bench/bench.py --warmup 3 --repeat 9`.
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
@@ -64,28 +79,25 @@ out (steady-state pipelines). Reproduce with
 | find_peaks | 2^23, prominence=1 | 227.18 ms | 92.43 ms | — | **2.5x**² |
 | peak_prominences | 2^23, 2.8M peaks | 170.93 ms | 20.92 ms | — | **8.2x**² |
 
-¹ MLX 0.32's Metal FFT is broken above 2^20 (see *Known limitations*);
-mlx-signal runs those transform lengths through its own four-step (Bailey)
-decomposition entirely on the GPU. Power-of-two lengths (2^21–2^26) use a
-fused three-pass Metal kernel pipeline — tiled loads, multi-column radix-2
-FFTs in threadgroup memory, on-the-fly exact-phase twiddles — ~2x the
-composed chain at 2^23, ~5x at 2^26, and *more accurate* than MLX's own
-large-n FFT; other factorable lengths use batched safe-size sub-FFTs plus a
-fused twiddle multiply. Only lengths with no safe factorization (e.g. large
-primes) fall back to a CPU-stream FFT.
-² `find_peaks`' prominence stage — scipy's dominant cost, a sequential walk
-from every peak — runs on the GPU (one thread per peak with block-skip aux,
-bit-identical to scipy); the remaining index bookkeeping is host-side by
-design, which caps the end-to-end win near ~2.5x.
+¹ MLX 0.32's Metal FFT fails at some lengths above 2^20. mlx-signal handles
+them with its own four-step (Bailey) GPU decomposition. Power-of-two lengths
+from 2^21 through 2^26 use three fused Metal passes: about 2x faster than the
+composed path at 2^23 and 5x at 2^26, with better accuracy than MLX's large
+FFT. Other factorable lengths use safe-size sub-FFTs; only lengths without a
+safe factorization, such as large primes, use the CPU stream. See
+[Known limitations](#known-limitations).
 
-## How it compares beyond scipy
+² The expensive prominence search in `find_peaks` runs on the GPU and matches
+SciPy bit for bit. Index bookkeeping stays on the host, limiting the overall
+speedup to about 2.5x.
 
-Other Mac-runnable implementations exist for parts of this API: torch/torchaudio
-(CPU and the MPS GPU backend), `jax.scipy.signal` (XLA CPU), librosa, and soxr.
-Same machine, conventions aligned, every output verified against scipy before
-publication (full details: [bench/results/cross.md](bench/results/cross.md), reproduce
-with `uv sync --extra bench && uv run python bench/bench_cross.py`). End-to-end
-(NumPy in/out), best per row in bold:
+## Comparison with other libraries
+
+This end-to-end comparison uses the same machine and NumPy input/output. Shapes
+and conventions are aligned, and every result is checked against SciPy. The
+fastest result in each row is bold. See the
+[full report](bench/results/cross.md), or reproduce it with
+`uv sync --extra bench && uv run python bench/bench_cross.py`.
 
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -95,94 +107,77 @@ with `uv sync --extra bench && uv run python bench/bench_cross.py`). End-to-end
 | resample 48k→44.1k, 16ch × 2^20 | 126 ms | **3.4 ms**¹ | 8.6 ms¹ | 6.3 ms¹ | — | 57 ms | 54 ms |
 | causal FIR, 64ch × 2^20, 257 taps | 1662 ms | **14 ms** | 2815 ms² | 77 ms² | — | — | — |
 
-¹ Task-level: torchaudio's default anti-aliasing filter (`lowpass_filter_width=6`)
-is far shorter than scipy's/ours (3201 taps here) — mlx-signal beats torchaudio-MPS
-end-to-end while retaining scipy's default anti-alias design and scipy-identical
-output; once arrays live on the GPU it runs 3.4x faster (0.99 vs 3.34 ms).
-² torchaudio exposes FFT convolution separately, but its `lfilter` API does not
-auto-select an FFT FIR path; the direct causal FIR analogue uses `conv1d` (O(n·k)).
-Torchaudio's `lfilter` (its general IIR machinery) takes
-**3.4 s on CPU and 22.4 s on MPS** for this FIR case — over 1600x slower than
-mlx-signal — which is exactly the patchy-MPS-coverage problem this library exists
-to avoid.
+¹ Torchaudio's default anti-aliasing filter is much shorter
+(`lowpass_filter_width=6`, versus 3201 taps here). mlx-signal keeps SciPy's
+default filter and matching output, yet still wins end to end. With arrays
+already on the GPU, it is 3.4x faster (0.99 versus 3.34 ms).
 
-Takeaways: nothing else offers GPU `welch`/`csd`/`coherence` (JAX mirrors scipy
-on CPU only; torchaudio has no PSD estimation) — and here `csd`/`coherence` get
-their own two-signal variant of the fused kernel that computes both spectra and
-the cross spectrum in a single sweep (coherence: one pass instead of scipy's
-five). `upfirdn`/`find_peaks` are scipy-only elsewhere. The closest competitor —
-`torch.stft` on MPS — trails mlx-signal end to end in this run (4.35 vs
-4.28 ms; the NumPy↔GPU copy still dominates and varies) and loses decisively
-on-device, where the transform itself runs 2.7x faster here
-(0.92 ms vs 2.47 ms); and it ships inside a 2 GB torch dependency with the
-`lfilter` cliff above. The
-speed comes from a fused Metal kernel (`_stft_metal.py`): one threadgroup per
-segment runs strided load → mean-detrend → window → a full radix-2 Stockham FFT
-in threadgroup memory — welch's entire per-segment pipeline reads the signal
-once and writes |X|² once, with no frames array ever materialized. `istft` runs
-the mirror image: a per-segment inverse-Stockham kernel plus a gather-based
-overlap-add (one thread per output sample sums its few overlapping segments —
-no scatters, norm divide folded in). Non-pow2 or otherwise ineligible shapes
-use the composed path: zero-copy `as_strided` framing, `mx.compile`-fused
-detrend+window, scaling folded into the window.
+² Torchaudio offers FFT convolution, but `lfilter` does not select it
+automatically. The closest causal FIR operation is `conv1d` (O(n·k)), used in
+the table. Torchaudio's general `lfilter` takes **3.4 s on CPU and 22.4 s on
+MPS** for this case—more than 1600x slower than mlx-signal.
 
-## Install
+What the comparison shows:
 
-Requires Apple Silicon, macOS ≥ 13.5, Python ≥ 3.10.
+- In this group, mlx-signal is the only GPU implementation of
+  `welch`/`csd`/`coherence`. JAX runs those APIs on CPU, and torchaudio has no
+  PSD estimator. The fused two-signal kernel computes coherence in one pass,
+  compared with five in SciPy.
+- `upfirdn` and `find_peaks` have no comparable implementation in the other
+  libraries tested.
+- `torch.stft` on MPS is close end to end (4.35 versus 4.28 ms) because data
+  transfer dominates and the NumPy-to-GPU copy time varies. On-device,
+  mlx-signal is 2.7x faster (0.92 versus 2.47 ms), without pulling in the 2 GB
+  torch dependency.
 
-```bash
-git clone https://github.com/tabulai/mlx-signal && cd mlx-signal
-pip install -e .            # or: uv pip install -e .
-python -m pytest -q         # full golden suite against scipy and NumPy
-```
-
-(PyPI release planned for 0.1.0.)
+The spectral hot path uses fused Metal kernels. STFT/Welch read each segment
+once without materializing a frames array; ISTFT combines an inverse transform
+with gather-based overlap-add. Shapes that do not fit the fused path use
+zero-copy framing and compiled MLX operations.
 
 ## What's implemented (v0.1)
 
 | area | functions | notes |
 |---|---|---|
-| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | one shared core; fused Stockham Metal kernels on the pow2 hot path (two-signal csd/coherence variant, inverse+gather-OLA for istft), batched FFT otherwise; all windows, detrend, scaling, axis, median averaging |
-| convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-d, all modes, complex; pow2-padded FFTs; long×short convolutions auto-block, and filters ≤1025 taps run a fused kernel pair (block FFT, spectrum multiply, inverse FFT in threadgroup memory) reassembled by gather-OLA; `fftconvolve(x, x)` and `correlate(x, x)` skip the second forward transform |
-| resampling | `upfirdn` `resample` `resample_poly` `decimate` | custom Metal kernel for `upfirdn`: one thread per output sample, polyphase geometry in 32-bit arithmetic whenever indices fit (Apple GPUs emulate 64-bit divides — worth ~4x at high `up`), taps staged through threadgroup memory only where measured to pay (pure decimation with a wide gather stride), complex-native — an IQ stream is one launch; every scipy signal-extension mode via on-device boundary extension, and the statistical padtypes via on-device background subtraction |
-| filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | FIR, SOS-IIR, and transfer-function-IIR paths on GPU (sequential + block-parallel scan kernels, single channel up; tf form to order 16 with native `zi`/`zf`) with scipy-exact edge handling; design host-side |
-| peaks | `find_peaks` `peak_prominences` `peak_widths` | exact scipy parity; prominence base-search on GPU for f32 sources (one thread per peak, two-level block-skip scan), index bookkeeping host-side |
-| utilities | `get_window` `next_fast_len` | cached windows; pow2 fast lengths |
+| spectral | `periodogram` `welch` `csd` `coherence` `spectrogram` `stft` `istft` | all SciPy windows, detrending, scaling, axes, and median averaging; fused power-of-two GPU paths, including two-signal CSD/coherence and inverse-plus-overlap-add ISTFT; batched FFT otherwise |
+| convolution | `convolve` `fftconvolve` `oaconvolve` `correlate` `correlation_lags` | N-D, every mode, and complex data; long×short inputs block automatically; filters up to 1025 taps use fused FFT kernels; equal-input convolution and correlation skip a duplicate transform |
+| resampling | `upfirdn` `resample` `resample_poly` `decimate` | complex-native GPU `upfirdn`; safe 32-bit indexing avoids emulated 64-bit divides (about 4x faster at high `up`); every SciPy signal-extension mode and statistical pad type handled on-device |
+| filtering | `firwin` `firwin2` `lfilter` `filtfilt` `sosfilt` `sosfiltfilt` `hilbert` | GPU FIR, SOS-IIR, and transfer-function IIR, including single-channel data and native `zi`/`zf`; transfer-function order up to 16; SciPy-compatible edges; filter design stays on the host |
+| peaks | `find_peaks` `peak_prominences` `peak_widths` | SciPy parity; prominence search on the GPU for float32 data, with index bookkeeping on the host |
+| utilities | `get_window` `next_fast_len` | cached windows and power-of-two fast lengths |
 
-**IIR runs on the GPU — even single-channel.** `sosfilt`/`sosfiltfilt` (and
-`decimate`'s default `ftype="iir"`) run scipy's exact direct-form-II-transposed
-cascade in custom Metal kernels with native `zi`/`zf` state, so streaming
-chunk-by-chunk works. `lfilter`/`filtfilt` with `len(a) > 1` (transfer-function
-form) get the same treatment: an order-N DF2T kernel pair that spells out the
-fused-multiply-add structure of scipy's compiled recurrence. The sequential
-kernel is bit-identical to matching scipy-in-float32 builds up to order 16
-(128x at 256 channels, 27x single-channel device-side).
-Long signals use a block-parallel associative-scan kernel: the filter is a
-linear system, so blocks compute their contributions in parallel and entry
-states compose through the host-precomputed `A^L` transition — parallel over
-time as well as channels, matching scipy's float32 results to ~1e-6 for
-typical wideband filters (~1e-5 worst-case for resonant tf filters near the
-scan gate) and beating scipy from one channel up. Short signals use a
-per-channel-sequential kernel when there are enough channels, else scipy.
-High-order clustered-pole tf filters keep the exact sequential kernel (the
-scan's companion-form transition is non-normal there); complex coefficients
-and orders past 16 fall back to scipy with a `FallbackWarning` — use the
-better-conditioned SOS form, as scipy itself recommends. You will not
-silently run on one core believing you're on 40 GPU cores.
+### IIR filtering
+
+`lfilter`, `filtfilt`, `sosfilt`, `sosfiltfilt`, and the default IIR path in
+`decimate` run on the GPU, including single-channel inputs. SOS and
+transfer-function filters support native `zi`/`zf`, so state can carry across
+chunks. Transfer-function filters are supported through order 16.
+
+Long signals use a block-parallel scan; shorter jobs use a sequential kernel
+when worthwhile, then fall back to SciPy. In the table above, transfer-function
+filtering reaches 128x at 256 channels and 27x for a single channel on-device.
+The sequential path is bit-identical to matching SciPy float32 builds. The
+parallel path typically matches to about 1e-6, with roughly 1e-5 worst-case
+error for resonant filters near its routing threshold.
+
+High-order filters with clustered poles stay on the sequential path. Complex
+coefficients and transfer-function orders above 16 fall back to SciPy with a
+`FallbackWarning`; use SOS form for those filters.
 
 ## Dispatch: when the GPU is used
 
-Kernel launches cost more than tiny problems do, so smaller inputs would *lose* on
-the GPU. Every function routes automatically:
+GPU launches do not pay off for small inputs, so mlx-signal can choose the
+backend for each call:
 
-- **`dispatch="auto"`** (default): inputs above `gpu_min_size` (default 2^15
-  elements of work) run on MLX; smaller inputs run scipy. Both return identical
-  MLX-array types/dtypes, so the routing is invisible.
-- **`dispatch="mlx"`**: always MLX; calls with no MLX path raise
-  `NotImplementedError` instead of falling back (pin the GPU in tests).
-- **`dispatch="scipy"`**: scipy numerical kernels (the correctness reference for
-  canonical float32/complex64 operands; still returns MLX arrays). It does not
-  opt back into float64 SOS arithmetic.
+- **`dispatch="auto"`** (default) uses MLX above `gpu_min_size` (2^15 work
+  elements by default) and SciPy below it.
+- **`dispatch="mlx"`** always uses MLX and raises `NotImplementedError` when no
+  MLX path exists.
+- **`dispatch="scipy"`** uses SciPy's numerical kernels with canonical
+  float32/complex64 inputs. It still returns MLX arrays and does not restore
+  float64 SOS arithmetic.
+
+All three modes return the same MLX types and dtypes.
 
 ```python
 sig.set_config(dispatch="mlx")                  # global
@@ -190,91 +185,85 @@ with sig.config_context(gpu_min_size=1 << 18):  # scoped
     ...
 ```
 
-Capability fallbacks (complex IIR coefficients, tf orders past 16, callable
-detrend, boundary modes on signals shorter than their extension, and exceptional
-non-finite tap/statistical-padding cases) warn loudly;
-size-based routing is silent by design.
+Capability fallbacks issue a warning. Examples include complex IIR
+coefficients, transfer-function orders above 16, callable detrending, signals
+too short for a requested boundary extension, and exceptional non-finite
+filter or padding cases. Size-based routing is silent.
 
 ## Dtype policy
 
-Metal has no float64, period. Computation is **float32/complex64**. Explicit
-float64/complex128 signal and state arrays downcast with a one-time `DowncastWarning`
-(`set_config(float64="strict")` to raise instead; `warn_on_downcast=False` to
-hush). Golden tests hold the fp32 pipeline to `rtol=1e-4` with a peak-relative
-`atol≈1e-5` against float64 scipy references — honest fp32 accuracy, documented
-rather than hidden. SciPy filter-design routines naturally return tiny float64
-SOS coefficient arrays; these canonicalize quietly to float32 by default (strict
-mode rejects them), and a design that becomes unstable or loses a section's
-numerator during quantization raises before filtering. Explicit complex128 or
-extended-precision SOS arrays follow the downcast-warning policy. With scipy
-older than 1.15, scan-unsafe `auto` SOS calls stay on scipy because that
-backend's historical float32 recurrence order differs from the Metal kernel
-(transfer-function `lfilter` probes the installed scipy's rounding directly —
-it is a compiler property, not a version — and applies the same conservative
-routing on a non-matching build). One hardware caveat: Apple GPUs flush
-float32 denormals (magnitudes below ~1.2e-38) to zero where CPU scipy keeps
-them, so bit-identity claims for the IIR kernels hold for normal-range data.
+- Computation uses **float32/complex64** because Metal does not support
+  float64.
+- Explicit float64/complex128 signal and state arrays downcast with a one-time
+  `DowncastWarning`. Use `set_config(float64="strict")` to raise instead, or
+  `warn_on_downcast=False` to disable the warning. Extended-precision SOS
+  arrays follow the same rule.
+- The parity suite compares the float32 pipeline with float64 SciPy references
+  at `rtol=1e-4` and a peak-relative `atol≈1e-5`.
+- SciPy's filter-design functions normally return small float64 SOS arrays.
+  These convert quietly unless strict mode is enabled. Filtering stops with an
+  error if conversion makes a design unstable or erases a section numerator.
+- With SciPy older than 1.15, unsafe automatic SOS scans stay on SciPy because
+  its historical float32 recurrence order differs from the Metal kernel.
+  Transfer-function `lfilter` probes the installed SciPy build and takes the
+  same conservative route when its compiler-dependent rounding differs.
+- Apple GPUs flush float32 denormals below about 1.2e-38 to zero; CPU SciPy
+  keeps them. IIR bit-identity therefore applies to normal-range data.
 
 ## Known limitations
 
-- **MLX 0.32 Metal FFT above 2^20 is broken upstream** — lengths in
-  (2^19, 2^21] except 2^20 *crash* ("Unable to load function four_step_mem_…"),
-  and, worse, other lengths above 2^20 *silently return wrong values*
-  (rel. error ~1.0). mlx-signal verified the safe region empirically and works
-  around it on the GPU: 1-D transforms use an in-library four-step (Bailey)
-  decomposition into safe-size sub-FFTs (`_fourstep.py`), and long×short
-  `fftconvolve` switches to blocked overlap-add. Equal-size real pairs and
-  autocorrelations at these lengths stay in the even/odd packed domain end to
-  end — the product spectrum's inverse-transform input is computed directly
-  from the packed forward transforms, so the untangle passes never run. Only unsplittable lengths
-  (large primes) and the N-d FFT paths route through the MLX CPU stream
-  (`_fft_core.py`). When MLX
-  fixes this, relaxing one predicate retires the workaround. (Worth reporting
-  upstream to `ml-explore/mlx` if you can reproduce it.)
+- **MLX 0.32 has an upstream Metal FFT issue above 2^20.** Lengths in
+  (2^19, 2^21], except 2^20, crash with
+  `Unable to load function four_step_mem_…`; other lengths above 2^20 can
+  return incorrect values with relative error around 1.0. mlx-signal uses its
+  own four-step decomposition for 1-D transforms and blocked overlap-add for
+  long×short convolution. Unsplittable lengths such as large primes, and N-D
+  FFT paths, use MLX's CPU stream. The workaround can be removed when MLX fixes
+  the affected range.
 - Windows/filter design (`get_window`, `firwin*`) and `find_peaks`' index
-  refinement run host-side — tiny work, and it keeps exact scipy parity
-  (the prominence base-search itself runs on the GPU for f32 sources).
+  refinement run on the host. The prominence search itself runs on the GPU for
+  float32 inputs.
 - `lfilter`/`sosfilt` take and return `zi`/`zf` state natively on the GPU for
-  IIR filters; FIR `lfilter` with `zi` follows scipy's convolution path on the
-  CPU (falls back, warns).
-- `upfirdn` serves every scipy signal-extension mode on the GPU by
-  pre-extending the boundary on-device. Signals shorter than the required
-  boundary extension (roughly the tap count over `up`, rounded up for
-  downsample-phase alignment) fall back, as do non-finite filter taps whose
-  multiplication by scipy's implicit edge zeros has exceptional NaN/Inf semantics.
-- Streaming/chunked APIs, `ShortTimeFFT`, and CWT are not yet implemented (below).
+  IIR filters. FIR `lfilter` with `zi` uses SciPy's CPU convolution path and
+  warns.
+- `upfirdn` handles every SciPy extension mode on-device. It falls back for
+  signals shorter than the required extension (roughly the tap count divided
+  by `up`, adjusted for downsampling phase), and for non-finite taps with
+  exceptional NaN/Inf edge semantics.
+- Streaming APIs, `ShortTimeFFT`, and CWT are not yet implemented.
 
 ## Roadmap
 
-- **CWT** — scipy *removed* `cwt` in 1.15, so this is a differentiator, not a clone
+- CWT (removed from SciPy in 1.15)
 - Modern `ShortTimeFFT` class
-- fp16 mode; real-time streaming API; torchaudio benchmark column
+- float16 mode
+- Real-time streaming API
+- Torchaudio benchmark coverage
 
 ## Examples
 
 - [`examples/fm_demod.py`](examples/fm_demod.py) — an SDR FM demodulation
   chain (channel filter → polyphase decimate → discriminator → de-emphasis →
-  audio resample), 16.5x end-to-end vs scipy on an M4 Max, with 0.999
+  audio resample), 16.5x end-to-end versus SciPy on an M4 Max, with 0.999
   correlation to the true message.
 - [`examples/eeg_bandpower.py`](examples/eeg_bandpower.py) — 64-channel × 10-minute
-  EEG alpha-band power via one batched `welch`, 6x vs scipy including result
+  EEG alpha-band power via one batched `welch`, 6x versus SciPy including result
   readback.
 
 ## Development
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-python -m pytest -q          # golden tests vs scipy (CPU-safe; GPU tests auto-skip)
+python -m pytest -q          # parity tests against SciPy
 ruff check src tests
-python bench/bench.py        # GPU benchmark — the release gate runs on real hardware
+python bench/bench.py        # GPU benchmark
 ```
 
-CI runs lint + the full test suite on GitHub's arm64 macOS runners; the MLX CPU
-backend covers every path except the custom Metal kernel (marked `gpu`).
+CI runs lint and the full test suite on GitHub's arm64 macOS runners. Tests
+marked `gpu` require a Metal device; the rest also exercise MLX's CPU backend.
 
 ## Acknowledgments
 
-- **SciPy** — the API contract and the golden reference. Edge-case semantics were
-  matched against scipy.signal (BSD-3-Clause) and are verified by the parity suite.
-- **MLX** — the lazy, unified-memory array framework that makes the zero-copy
-  story possible.
+- **SciPy** provides the API contract and numerical reference. Edge cases are
+  matched against `scipy.signal` (BSD-3-Clause) in the parity suite.
+- **MLX** provides the lazy, unified-memory array framework.
