@@ -11,10 +11,15 @@ transposes, all standard MLX ops on the GPU:
     X  = C.swap(-2, -1).reshape(N)        # k = k1*N2 + k2
 
 Real transforms ride on top via the even/odd packing trick (identical math to
-the Stockham kernel's untangle, vectorized), inverses via conjugation. The
-twiddle phase is computed from an exact int64 outer product mod N, so accuracy
-holds at any size. Lengths with no factorization into two safe factors (e.g.
-large primes) return None and the caller keeps its CPU-stream fallback.
+the Stockham kernel's untangle, vectorized), inverses via the same
+decomposition with ifft sub-transforms and conjugated twiddles. The twiddle
+phase is computed from an exact int64 outer product mod N, so accuracy holds
+at any size. Power-of-two lengths in the measured envelope (2^21..2^26) skip
+this composed chain entirely for the fused three-pass kernel pipeline in
+``_fourstep_metal`` (~2x at 2^23, ~5x at 2^26, more accurate than the
+composed chain, and no materialized twiddle table). Lengths with no
+factorization into two safe factors (e.g. large primes) return None and the
+caller keeps its CPU-stream fallback.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import functools
 import mlx.core as mx
 import numpy as np
 
+from . import _fourstep_metal
 from ._cache import TWIDDLES
 from ._fft_core import metal_fft_broken
 
@@ -99,6 +105,10 @@ def _fft_4step_last(a: mx.array) -> mx.array:
     n = a.shape[-1]
     if not metal_fft_broken(n):
         return mx.fft.fft(a, axis=-1)
+    if a.size and _fourstep_metal.eligible(n):
+        # fused three-pass kernel pipeline: ~2x at 2^23, ~5x at 2^26, and
+        # more accurate than this composed chain (see _fourstep_metal)
+        return _fourstep_metal.fft3_last(a)
     split = _choose_split(n)
     assert split is not None, "caller must check splittability"
     n1, n2 = split
@@ -109,10 +119,35 @@ def _fft_4step_last(a: mx.array) -> mx.array:
     return mx.swapaxes(C, -2, -1).reshape(batch + (n,))
 
 
+# b * conj(t) in one fused pass: the inverse four-step needs the conjugated
+# twiddle, and conjugating inside the compiled multiply costs nothing while a
+# second cached table would double the twiddle footprint
+_conj_twiddle_mul_fused = mx.compile(lambda b, t: b * mx.conj(t))
+
+
 def _ifft_4step_last(a: mx.array) -> mx.array:
+    """Inverse via the same decomposition run with ifft sub-transforms.
+
+    The inverse DFT is a DFT with the conjugate kernel, so the four-step
+    identity applies verbatim: ifft sub-transforms (whose built-in 1/N1 and
+    1/N2 compose to the full 1/n) and a conjugated twiddle. This deletes the
+    former conj/fft/conj/scale formulation's three extra full-size passes.
+    """
     n = a.shape[-1]
-    out = mx.conj(_fft_4step_last(mx.conj(a)))
-    return out * mx.array(1.0 / n, dtype=mx.float32)
+    if not metal_fft_broken(n):
+        return mx.fft.ifft(a, axis=-1)
+    if a.size and _fourstep_metal.eligible(n):
+        return _fourstep_metal.fft3_last(a, inverse=True)
+    split = _choose_split(n)
+    assert split is not None, "caller must check splittability"
+    n1, n2 = split
+    batch = a.shape[:-1]
+    A = a.reshape(batch + (n2, n1))
+    B = mx.fft.ifft(mx.swapaxes(A, -2, -1), axis=-1)  # (..., n1, n2)
+    C = mx.fft.ifft(
+        mx.swapaxes(_conj_twiddle_mul_fused(B, _twiddle(n1, n2)), -2, -1), axis=-1
+    )
+    return mx.swapaxes(C, -2, -1).reshape(batch + (n,))
 
 
 def _half_twiddle(m: int) -> mx.array:
