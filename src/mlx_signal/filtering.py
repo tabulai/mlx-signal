@@ -60,15 +60,19 @@ def hilbert(x, N=None, axis=-1):
         return result_to_mlx(sps.hilbert(signal_np(x), N=N, axis=axis))
 
     xa = mx.moveaxis(xa, axis, -1) if xa.ndim > 1 else xa
-    Xf = _sfft.fft(xa.astype(mx.complex64), n=N, axis=-1)
-    h = np.zeros(N, dtype=np.float32)
-    h[0] = 1.0
+    # rfft halves the forward transform (the input is real); the analytic
+    # spectrum is then assembled directly — doubled positive bins, zeroed
+    # negatives — instead of masking a full complex-FFT spectrum
+    Xr = _sfft.rfft(xa, n=N, axis=-1)
     if N % 2 == 0:
-        h[1 : N // 2] = 2.0
-        h[N // 2] = 1.0
+        parts = [Xr[..., :1], 2.0 * Xr[..., 1 : N // 2], Xr[..., N // 2 : N // 2 + 1]]
+        n_zero = N // 2 - 1
     else:
-        h[1 : (N + 1) // 2] = 2.0
-    out = _sfft.ifft(Xf * mx.array(h), axis=-1)
+        parts = [Xr[..., :1], 2.0 * Xr[..., 1 : (N + 1) // 2]]
+        n_zero = N - (N + 1) // 2
+    if n_zero:
+        parts.append(mx.zeros(Xr.shape[:-1] + (n_zero,), dtype=mx.complex64))
+    out = _sfft.ifft(mx.concatenate(parts, axis=-1), axis=-1)
     if out.ndim > 1:
         out = mx.moveaxis(out, -1, axis)
     return out

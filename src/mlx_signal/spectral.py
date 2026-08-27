@@ -749,6 +749,13 @@ def _overlap_add(xsubs_t: mx.array, outputlength: int, nstep: int) -> mx.array:
     return out.reshape(batch_shape + (outputlength,))
 
 
+#: cached NOLA verdicts keyed by the exact overlap-add geometry: the norm
+#: array is a pure function of (window, nperseg, nstep, nseg, outputlength,
+#: boundary), so steady-state istft calls skip the device->host sync that
+#: evaluating it forces mid-graph
+_NOLA_CACHE: dict = {}
+
+
 def istft(
     Zxx,
     fs=1.0,
@@ -895,8 +902,16 @@ def istft(
         x = x[..., nperseg // 2 : -(nperseg // 2)]
         norm = norm[nperseg // 2 : -(nperseg // 2)]
 
-    norm_np = np.array(norm)
-    if np.sum(norm_np > 1e-10) != len(norm_np):
+    nola_key = (win_np.tobytes(), int(nperseg), int(nstep), int(nseg),
+                int(outputlength), bool(boundary), divided)
+    nola_ok = _NOLA_CACHE.get(nola_key)
+    if nola_ok is None:
+        norm_np = np.array(norm)  # forces one eval; cached per geometry after
+        nola_ok = bool(np.sum(norm_np > 1e-10) == len(norm_np))
+        if len(_NOLA_CACHE) >= 256:
+            _NOLA_CACHE.clear()
+        _NOLA_CACHE[nola_key] = nola_ok
+    if not nola_ok:
         warnings.warn(
             "NOLA condition failed, STFT may not be invertible."
             + (" Possibly due to missing boundary" if not boundary else ""),
