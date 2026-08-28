@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-import mlx_signal
+import mlx_signal_processing
 
 # Set MLX_SIGNAL_SIMULATE_NO_METAL=1 to exercise the no-GPU code paths on a
 # machine that has Metal (also used by CI).
@@ -31,9 +31,9 @@ def _pin_mlx_path():
     for kernel-only capabilities.
     """
     if HAS_GPU:
-        ctx = mlx_signal.config_context(dispatch="mlx", warn_on_downcast=False)
+        ctx = mlx_signal_processing.config_context(dispatch="mlx", warn_on_downcast=False)
     else:
-        ctx = mlx_signal.config_context(
+        ctx = mlx_signal_processing.config_context(
             dispatch="auto", gpu_min_size=0, warn_on_downcast=False,
             warn_on_fallback=False,
         )

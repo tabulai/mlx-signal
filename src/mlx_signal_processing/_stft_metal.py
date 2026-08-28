@@ -169,7 +169,7 @@ def _kernel(N: int, detrend: bool, power: bool):
     out = (_OUT_POWER if power else _OUT_COMPLEX).format(M=M, T=T)
     src = _SRC.format(M=M, S=S, T=T, LOAD_BLOCK=load, OUT_BLOCK=out)
     kern = mx.fast.metal_kernel(
-        name=f"mlx_signal_stft_{N}_{int(detrend)}_{int(power)}",
+        name=f"mlx_signal_processing_stft_{N}_{int(detrend)}_{int(power)}",
         input_names=["x", "win", "tw", "ut", "params"],
         output_names=["out"],
         source=src,
@@ -366,7 +366,7 @@ def _pair_kernel(N: int, detrend: bool, trio: bool):
         OUT_BLOCK=out,
     )
     kern = mx.fast.metal_kernel(
-        name=f"mlx_signal_csd_{N}_{int(detrend)}_{int(trio)}",
+        name=f"mlx_signal_processing_csd_{N}_{int(detrend)}_{int(trio)}",
         input_names=["xa", "xb", "tw", "ut", "win", "params"],
         output_names=["pxx", "pyy", "pxy"] if trio else ["out"],
         source=src,
@@ -506,14 +506,14 @@ def _istft_kernels(N: int):
     S = int(math.log2(M))
     T = min(256, max(32, M // 2))
     inv = mx.fast.metal_kernel(
-        name=f"mlx_signal_istft_{N}",
+        name=f"mlx_signal_processing_istft_{N}",
         input_names=["zin", "wineff", "tw", "ut", "params"],
         output_names=["out"],
         source=_ISTFT_SRC.format(N=N, M=M, T=T, FFT=_PAIR_FFT.format(M=M, S=S, T=T)),
         header=_HEADER.format(M=M),
     )
     ola = mx.fast.metal_kernel(
-        name=f"mlx_signal_ola_{N}",
+        name=f"mlx_signal_processing_ola_{N}",
         input_names=["segs", "win", "params"],
         output_names=["out", "normout"],
         source=_OLA_SRC.format(N=N),
@@ -678,14 +678,14 @@ def _fftconv_kernels():
     T = min(256, max(32, M // 2))
     fft = _PAIR_FFT.format(M=M, S=S, T=T)
     fwd = mx.fast.metal_kernel(
-        name=f"mlx_signal_fftconv_fwd_{N}",
+        name=f"mlx_signal_processing_fftconv_fwd_{N}",
         input_names=["x", "hf", "tw", "ut", "params"],
         output_names=["scratch"],
         source=_FFTCONV_FWD_SRC.format(N=N, M=M, T=T, FFT=fft),
         header=_HEADER.format(M=M),
     )
     inv = mx.fast.metal_kernel(
-        name=f"mlx_signal_fftconv_inv_{N}",
+        name=f"mlx_signal_processing_fftconv_inv_{N}",
         input_names=["scratch", "tw", "params"],
         output_names=["out"],
         source=_FFTCONV_INV_SRC.format(N=N, M=M, T=T, FFT=fft),

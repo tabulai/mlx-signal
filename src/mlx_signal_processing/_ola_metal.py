@@ -52,7 +52,7 @@ def _kernel(N: int, cplx: bool):
         fetch = "acc += segs[off];"
         store = "out[(long)b * full_len + i] = acc;"
     return mx.fast.metal_kernel(
-        name=f"mlx_signal_conv_ola_{N}_{int(cplx)}",
+        name=f"mlx_signal_processing_conv_ola_{N}_{int(cplx)}",
         input_names=["segs", "params"],
         output_names=["out"],
         source=_SRC.format(N=N, W=2 if cplx else 1, ACCT=acct, ZERO=zero,

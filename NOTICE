@@ -1,0 +1,7 @@
+mlx-signal third-party notice
+
+The public API and edge-case behavior of this project are modeled after
+scipy.signal. SciPy is distributed under the BSD 3-Clause License and is
+Copyright (c) 2001-2026 SciPy Developers.
+
+https://scipy.org/

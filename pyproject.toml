@@ -1,22 +1,27 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mlx-signal"
-version = "0.1.0.dev0"
+name = "mlx-signal-processing"
+dynamic = ["version"]
 description = "Metal/MLX-accelerated signal processing for Apple Silicon, mirroring scipy.signal"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Bojan Tunguz" }]
 keywords = ["mlx", "metal", "signal-processing", "apple-silicon", "dsp", "scipy"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
@@ -32,9 +37,25 @@ bench = ["torch", "torchaudio", "librosa", "soxr", "jax"]
 
 [project.urls]
 Homepage = "https://github.com/tabulai/mlx-signal"
+Documentation = "https://github.com/tabulai/mlx-signal#readme"
+Issues = "https://github.com/tabulai/mlx-signal/issues"
+Source = "https://github.com/tabulai/mlx-signal"
+
+[tool.hatch.version]
+path = "src/mlx_signal_processing/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mlx_signal"]
+packages = ["src/mlx_signal_processing"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/NOTICE",
+    "/README.md",
+    "/pyproject.toml",
+    "/src",
+    "/tests",
+]
 
 [tool.ruff]
 line-length = 100

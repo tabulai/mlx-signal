@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 from _utils import assert_close
 
 

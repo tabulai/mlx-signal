@@ -40,7 +40,7 @@ import mlx.core as mx
 import numpy as np
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 
 try:
     from ._validation import rel_err, resample_quality

@@ -62,8 +62,8 @@ def set_config(**kwargs) -> None:
 
     Examples
     --------
-    >>> import mlx_signal
-    >>> mlx_signal.set_config(dispatch="mlx", warn_on_downcast=False)
+    >>> import mlx_signal_processing
+    >>> mlx_signal_processing.set_config(dispatch="mlx", warn_on_downcast=False)
     """
     # validate everything before mutating so a failure leaves state untouched
     for key in kwargs:
@@ -110,12 +110,12 @@ def capability_fallback(func_name: str, reason: str) -> None:
     """
     if _config.dispatch == "mlx":
         raise NotImplementedError(
-            f"mlx_signal.{func_name}: {reason} has no MLX path; "
+            f"mlx_signal_processing.{func_name}: {reason} has no MLX path; "
             "use dispatch='auto' to allow the scipy fallback"
         )
     if _config.warn_on_fallback:
         warnings.warn(
-            f"mlx_signal.{func_name}: {reason}; falling back to scipy.signal",
+            f"mlx_signal_processing.{func_name}: {reason}; falling back to scipy.signal",
             FallbackWarning,
             stacklevel=3,
         )

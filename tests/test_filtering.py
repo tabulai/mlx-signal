@@ -4,10 +4,10 @@ import numpy as np
 import pytest
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 from _utils import assert_close, assert_type_and_dtype
 from conftest import HAS_GPU
-from mlx_signal.filtering import _scipy_lfilter_f32_order_matches_metal
+from mlx_signal_processing.filtering import _scipy_lfilter_f32_order_matches_metal
 
 
 def test_firwin_matches_scipy():
@@ -81,7 +81,7 @@ def test_lfilter_iir_runs_without_fallback(rng):
 
 
 def test_lfilter_iir_order_above_cap_falls_back(rng):
-    from mlx_signal._lfilter_metal import MAX_ORDER
+    from mlx_signal_processing._lfilter_metal import MAX_ORDER
 
     x = rng.standard_normal(5000).astype(np.float32)
     # a stable high-order denominator: 17 poles well inside the unit circle
@@ -287,7 +287,7 @@ def test_lfilter_tf_scan_composition_matters(rng):
     transposing AL) shifts results ~2e-5 while pristine code stays ~1e-6."""
     import mlx.core as mx
 
-    from mlx_signal import _lfilter_metal
+    from mlx_signal_processing import _lfilter_metal
 
     if not mx.metal.is_available():
         pytest.skip("scan kernel needs Metal")
@@ -308,7 +308,7 @@ def test_lfilter_tf_scan_engages_and_drift_stays_bounded(rng, monkeypatch):
     ~1e-5 drift bound."""
     import mlx.core as mx
 
-    from mlx_signal import _lfilter_metal
+    from mlx_signal_processing import _lfilter_metal
 
     if not mx.metal.is_available():
         pytest.skip("scan kernel needs Metal")
@@ -460,7 +460,7 @@ def test_lfilter_tf_scan_and_sequential_kernels_agree(rng):
     """The two GPU implementations are independent; they must agree."""
     import mlx.core as mx
 
-    from mlx_signal import _lfilter_metal
+    from mlx_signal_processing import _lfilter_metal
 
     if not mx.metal.is_available():
         pytest.skip("no Metal GPU")

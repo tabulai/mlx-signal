@@ -11,7 +11,7 @@ import pytest
 import scipy
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 from _utils import assert_close, assert_type_and_dtype
 from conftest import HAS_GPU
 
@@ -175,7 +175,7 @@ def test_scan_and_sequential_kernels_agree(rng):
     """The two GPU implementations are independent; they must agree."""
     import mlx.core as mx
 
-    from mlx_signal import _sosfilt_metal
+    from mlx_signal_processing import _sosfilt_metal
 
     if not mx.metal.is_available():
         pytest.skip("no Metal GPU")
@@ -335,7 +335,7 @@ def test_old_scipy_scan_unsafe_auto_stays_on_scipy(monkeypatch, rng):
     filter must not switch recurrence at the 31/32-row auto boundary."""
     import mlx.core as mx
 
-    from mlx_signal import _sosfilt_metal, filtering
+    from mlx_signal_processing import _sosfilt_metal, filtering
 
     monkeypatch.setattr(filtering, "_scipy_sosfilt_f32_order_matches_metal", lambda: False)
     monkeypatch.setattr(mx.metal, "is_available", lambda: True)

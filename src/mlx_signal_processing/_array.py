@@ -18,7 +18,7 @@ def _downcast_notice(src: str) -> None:
         raise TypeError(
             f"{src} input is not supported with float64='strict' (Metal has no "
             "float64). Cast to float32/complex64, or set "
-            "mlx_signal.set_config(float64='downcast')."
+            "mlx_signal_processing.set_config(float64='downcast')."
         )
     if _config.warn_on_downcast:
         warnings.warn(
@@ -88,7 +88,7 @@ def check_strict(x) -> None:
         raise TypeError(
             "float64/complex128 input is not supported with float64='strict' "
             "(results are float32 on every dispatch path). Cast to "
-            "float32/complex64, or set mlx_signal.set_config(float64='downcast')."
+            "float32/complex64, or set mlx_signal_processing.set_config(float64='downcast')."
         )
 
 

@@ -21,7 +21,7 @@ import mlx.core as mx
 import numpy as np
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 
 FS = 2_400_000
 AUDIO_FS = 48_000

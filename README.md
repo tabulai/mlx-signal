@@ -9,7 +9,7 @@ NumPy or MLX arrays and returns MLX arrays in Apple's unified memory.
 
 ```python
 import numpy as np
-import mlx_signal as sig
+import mlx_signal_processing as sig
 
 x = np.random.randn(64, 1 << 20).astype(np.float32)
 frequencies, power = sig.welch(x, fs=48_000, nperseg=1024)
@@ -23,13 +23,21 @@ cost more than it saves.
 
 ## Install
 
-Requires Apple Silicon, macOS 13.5 or newer, and Python 3.10 or newer. Until the
-planned 0.1.0 PyPI release, install from a checkout:
+Requires Apple Silicon, macOS 14 or newer, and Python 3.10 or newer:
+
+```bash
+python -m pip install mlx-signal-processing
+```
+
+The distribution is named `mlx-signal-processing`; import it in Python as
+`mlx_signal_processing`.
+
+To work on mlx-signal from a checkout:
 
 ```bash
 git clone https://github.com/tabulai/mlx-signal
 cd mlx-signal
-pip install -e .            # or: uv pip install -e .
+python -m pip install -e .   # or: uv pip install -e .
 python -m pytest -q         # optional: run the SciPy parity suite
 ```
 
@@ -42,7 +50,9 @@ Values are medians of 9 runs after 3 warmups:
 - **e2e:** NumPy input and output, for drop-in use
 - **device:** MLX input and output, for an on-device pipeline
 
-See the [full report](bench/results/results.md), or reproduce it with
+See the
+[full report](https://github.com/tabulai/mlx-signal/blob/main/bench/results/results.md),
+or reproduce it with
 `python bench/bench.py --warmup 3 --repeat 9`.
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
@@ -96,7 +106,8 @@ speedup to about 2.5x.
 This end-to-end comparison uses the same machine and NumPy input/output. Shapes
 and conventions are aligned, and every result is checked against SciPy. The
 fastest result in each row is bold. See the
-[full report](bench/results/cross.md), or reproduce it with
+[full report](https://github.com/tabulai/mlx-signal/blob/main/bench/results/cross.md),
+or reproduce it with
 `uv sync --extra bench && uv run python bench/bench_cross.py`.
 
 | task | scipy | **mlx-signal** | torch/ta CPU | torch/ta MPS | jax (jit, CPU) | librosa | soxr |
@@ -242,11 +253,13 @@ filter or padding cases. Size-based routing is silent.
 
 ## Examples
 
-- [`examples/fm_demod.py`](examples/fm_demod.py) — an SDR FM demodulation
+- [`examples/fm_demod.py`](https://github.com/tabulai/mlx-signal/blob/main/examples/fm_demod.py)
+  — an SDR FM demodulation
   chain (channel filter → polyphase decimate → discriminator → de-emphasis →
   audio resample), 16.5x end-to-end versus SciPy on an M4 Max, with 0.999
   correlation to the true message.
-- [`examples/eeg_bandpower.py`](examples/eeg_bandpower.py) — 64-channel × 10-minute
+- [`examples/eeg_bandpower.py`](https://github.com/tabulai/mlx-signal/blob/main/examples/eeg_bandpower.py)
+  — 64-channel × 10-minute
   EEG alpha-band power via one batched `welch`, 6x versus SciPy including result
   readback.
 

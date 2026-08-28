@@ -4,10 +4,10 @@ import numpy as np
 import pytest
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 from _utils import assert_close, assert_type_and_dtype
 from conftest import HAS_GPU, requires_gpu
-from mlx_signal.resampling import _upfirdn_composed
+from mlx_signal_processing.resampling import _upfirdn_composed
 
 UPFIRDN_CASES = [
     # (n, up, down, n_taps)
@@ -95,7 +95,7 @@ def test_kernel_agrees_with_composed_path(rng, n, up, down, n_taps):
     """The Metal kernel and the FFT-composed MLX path are independent implementations."""
     import mlx.core as mx
 
-    from mlx_signal.resampling import _output_len, _upfirdn_plane_dispatch
+    from mlx_signal_processing.resampling import _output_len, _upfirdn_plane_dispatch
 
     x = mx.array(rng.standard_normal((3, n)).astype(np.float32))
     h = mx.array(rng.standard_normal(n_taps).astype(np.float32))
@@ -117,8 +117,8 @@ def test_u32_route_bit_identical(rng, cx, ch, n, up, down, n_taps):
     must be bit-identical, not merely close."""
     import mlx.core as mx
 
-    from mlx_signal import _upfirdn_metal as um
-    from mlx_signal.resampling import _output_len
+    from mlx_signal_processing import _upfirdn_metal as um
+    from mlx_signal_processing.resampling import _output_len
 
     x = rng.standard_normal((3, n)).astype(np.float32)
     if cx:
@@ -149,7 +149,7 @@ def test_u32_guard_accounts_for_float2_factors():
     """The u32 overflow guard must include the float32-view doubling: complex
     input doubles the flat x index, complex output doubles the store offset.
     A miss here is silent wrong output, so pin each term's boundary."""
-    from mlx_signal._upfirdn_metal import _U32_LIMIT, _fits_u32
+    from mlx_signal_processing._upfirdn_metal import _U32_LIMIT, _fits_u32
 
     assert _U32_LIMIT == 1 << 31
     # input side: B * n_in * (2 if complex signal)
@@ -174,7 +174,7 @@ def test_upfirdn_gpu_empty_taps_stores_zeros():
     zeros on the u32 route just like the long kernels — never read h."""
     import mlx.core as mx
 
-    from mlx_signal._upfirdn_metal import upfirdn_gpu
+    from mlx_signal_processing._upfirdn_metal import upfirdn_gpu
 
     out = upfirdn_gpu(mx.ones((2, 100)), mx.zeros((0,)), 2, 1, 199)
     np.testing.assert_array_equal(np.array(out), np.zeros((2, 199), np.float32))

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 
 
 def check_parity(x, **kwargs):
@@ -179,7 +179,7 @@ def test_prominences_block_max_equal_to_peak_is_not_terminator():
     """A distant block whose max EQUALS the peak height must be skipped or
     descended, never treated as a terminator — scipy's walk continues through
     equal values to the true base beyond it."""
-    from mlx_signal._peaks_metal import BLOCK
+    from mlx_signal_processing._peaks_metal import BLOCK
 
     x = np.full(5 * BLOCK, 4.0, np.float32)
     x[4 * BLOCK + 100] = 10.0   # queried peak (block 4)

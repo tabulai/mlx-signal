@@ -13,7 +13,7 @@ import time
 import numpy as np
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 
 FS = 500.0
 MINUTES = 10

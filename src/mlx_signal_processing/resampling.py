@@ -579,7 +579,7 @@ def decimate(x, q, n=None, ftype="iir", axis=-1, zero_phase=True):
     scipy-compatible signature. The FIR path (``ftype="fir"``) runs on the GPU
     (a hamming-window ``firwin(20*q+1, 1/q)`` filter applied via upfirdn); the
     default ``ftype="iir"`` (order-8 Chebyshev I) runs through the batched
-    GPU :func:`~mlx_signal.sosfiltfilt`/:func:`~mlx_signal.sosfilt` kernel.
+    GPU :func:`~mlx_signal_processing.sosfiltfilt`/:func:`~mlx_signal_processing.sosfilt` kernel.
     ``dlti`` instances fall back to scipy.
     """
     q = int(q)

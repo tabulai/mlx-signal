@@ -11,7 +11,7 @@ zero; scipy's CPU keeps them); the block-parallel scan matches to ~1e-6 for
 typical wideband filters and ~1e-5 worst-case near its dispatch gate. The
 SOS form remains the better-conditioned choice for high orders, as scipy
 itself recommends; complex coefficients and orders past the register cap
-fall back to scipy with a :class:`~mlx_signal.FallbackWarning`.
+fall back to scipy with a :class:`~mlx_signal_processing.FallbackWarning`.
 """
 
 from __future__ import annotations

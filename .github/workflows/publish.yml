@@ -1,0 +1,91 @@
+name: Publish Python distribution
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install build tools
+        run: python -m pip install --upgrade build "twine>=7"
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: Test built wheel
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Install wheel and test dependencies
+        run: python -m pip install "pytest>=8" "hypothesis>=6" dist/*.whl
+      - name: Run test suite against wheel
+        run: python -m pytest -q
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/mlx-signal-processing
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Upload distribution to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'release'
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mlx-signal-processing
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Upload distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

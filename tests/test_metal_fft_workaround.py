@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 from _utils import assert_close
 
 
@@ -59,7 +59,7 @@ def test_welch_large_nfft_in_hole(rng):
 def test_broken_predicate_boundaries():
     import mlx.core as mx
 
-    from mlx_signal._fft_core import metal_fft_broken
+    from mlx_signal_processing._fft_core import metal_fft_broken
 
     if not mx.metal.is_available():
         pytest.skip("CPU backend has no broken sizes")
@@ -79,7 +79,7 @@ def test_large_fft_values_correct_via_wrappers(rng):
     """Sizes where raw Metal FFT returns garbage must be correct through us."""
     import mlx.core as mx
 
-    from mlx_signal import _fft_core
+    from mlx_signal_processing import _fft_core
 
     x = rng.standard_normal(1 << 21).astype(np.float32)
     ref = np.fft.rfft(x.astype(np.float64))
@@ -99,8 +99,8 @@ def test_fused_stft_kernel_matches_composed_path(rng):
     """The Stockham kernel and the as_strided+rfft path are independent."""
     import mlx.core as mx
 
-    from mlx_signal import _stft_metal
-    from mlx_signal.spectral import _detrend_and_window, _frame_view
+    from mlx_signal_processing import _stft_metal
+    from mlx_signal_processing.spectral import _detrend_and_window, _frame_view
 
     if not (mx.metal.is_available() and hasattr(mx, "view")):
         pytest.skip("no Metal GPU")
@@ -136,8 +136,8 @@ def test_istft_kernel_matches_composed_path(rng, monkeypatch):
     """The inverse-Stockham + gather-OLA pair vs the scatter-based mx path."""
     import mlx.core as mx
 
-    import mlx_signal as msig
-    from mlx_signal import _stft_metal
+    import mlx_signal_processing as msig
+    from mlx_signal_processing import _stft_metal
 
     if not _stft_metal.eligible_istft(1024):
         pytest.skip("no Metal GPU")

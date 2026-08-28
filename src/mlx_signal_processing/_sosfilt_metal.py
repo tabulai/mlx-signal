@@ -65,7 +65,7 @@ _SRC = """
 @functools.lru_cache(maxsize=32)
 def _kernel(n_sections: int):
     return mx.fast.metal_kernel(
-        name=f"mlx_signal_sosfilt_{n_sections}",
+        name=f"mlx_signal_processing_sosfilt_{n_sections}",
         input_names=["x", "sos", "zi", "params"],
         output_names=["y", "zf"],
         source=_SRC.format(S=n_sections),
@@ -209,7 +209,7 @@ _P3_SRC = """
 def _scan_kernels(n_sections: int, L: int):
     def make(name, src, outs):
         return mx.fast.metal_kernel(
-            name=f"mlx_signal_sos_scan_{name}_{n_sections}_{L}",
+            name=f"mlx_signal_processing_sos_scan_{name}_{n_sections}_{L}",
             input_names={
                 "p1": ["x", "sos", "params"],
                 "p2": ["zi", "d", "AL", "params"],

@@ -129,7 +129,7 @@ _SRC = r"""
 @functools.lru_cache(maxsize=1)
 def _kernel():
     return mx.fast.metal_kernel(
-        name="mlx_signal_peak_prominence_bases",
+        name="mlx_signal_processing_peak_prominence_bases",
         input_names=["x", "peaks", "bmax", "bmin", "params"],
         output_names=["left_bases", "right_bases"],
         source=_SRC,

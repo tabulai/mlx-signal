@@ -6,11 +6,22 @@ on:
   pull_request:
 
 jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade build "twine>=7"
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install ruff
@@ -23,8 +34,8 @@ jobs:
     # gate instead.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -37,10 +48,10 @@ jobs:
   test-floor:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.10"
       - run: pip install "scipy==1.11.*" "numpy==1.24.*" "mlx==0.30.*" "pytest>=8"
       - run: pip install -e . --no-deps
       - run: python -m pytest -q

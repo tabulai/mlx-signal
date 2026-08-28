@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import scipy.signal as sps
 
-import mlx_signal as msig
+import mlx_signal_processing as msig
 from _utils import assert_close
 from conftest import HAS_GPU
 
@@ -113,7 +113,7 @@ def test_csd_nperseg_1_matches_scipy(rng):
 
 def test_fft_length_one_axis(rng):
     """MLX's batched length-1 rfft used to fold the batch into complex pairs."""
-    from mlx_signal import _fft_core
+    from mlx_signal_processing import _fft_core
 
     x = mx.array(rng.standard_normal((4, 1)).astype(np.float32))
     np.testing.assert_allclose(
@@ -154,7 +154,7 @@ def test_sosfilt_narrowband_long_signal_accurate(rng):
 
 def test_sosfilt_wideband_still_uses_scan(rng):
     """Well-conditioned filters must keep the fast scan path on long inputs."""
-    from mlx_signal.filtering import _scan_safe
+    from mlx_signal_processing.filtering import _scan_safe
 
     good = sps.butter(4, 0.2, output="sos")
     bad = sps.butter(2, 1e-5, output="sos")
@@ -309,7 +309,7 @@ def test_resample_complex_window_dc_nyquist(rng):
 
 
 def test_zero_dim_inputs():
-    from mlx_signal._array import to_mlx
+    from mlx_signal_processing._array import to_mlx
 
     assert to_mlx(np.float32(3.0)).shape == ()
     assert to_mlx(np.array(2.0)).shape == ()
@@ -331,7 +331,7 @@ def test_next_fast_len_edge_parity():
 def test_nd_fft_length_one_axis(rng):
     """The Metal n-d real FFT returns garbage for a length-1 transform axis;
     the wrappers must route those to the CPU stream."""
-    from mlx_signal import _fft_core
+    from mlx_signal_processing import _fft_core
 
     x = mx.array(rng.standard_normal((4, 1)).astype(np.float32))
     np.testing.assert_allclose(
@@ -348,7 +348,7 @@ def test_nd_fft_length_one_axis(rng):
 
 def test_zero_dim_dtype_policy():
     """0-d float64 arrays must honor strict/downcast like any other input."""
-    from mlx_signal._array import to_mlx
+    from mlx_signal_processing._array import to_mlx
 
     with msig.config_context(float64="strict"):
         with pytest.raises(TypeError, match="strict"):
@@ -366,7 +366,7 @@ def test_direct_method_scalar_shapes():
 
 
 def test_byte_budget_cache_hard_bound():
-    from mlx_signal._cache import ByteBudgetCache
+    from mlx_signal_processing._cache import ByteBudgetCache
 
     c = ByteBudgetCache(100)
     c.put(("big",), "v", 200)

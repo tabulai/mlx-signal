@@ -259,7 +259,7 @@ def _kernels(R3: int, R2: int, R1: int, sign: int):
             3: (["s2", "twt"], ["out"]),
         }[pid]
         kern = mx.fast.metal_kernel(
-            name=f"mlx_signal_fft3_p{pid}_{R3}_{R2}_{R1}_{'f' if sign < 0 else 'i'}",
+            name=f"mlx_signal_processing_fft3_p{pid}_{R3}_{R2}_{R1}_{'f' if sign < 0 else 'i'}",
             input_names=names[0],
             output_names=names[1],
             source=body,

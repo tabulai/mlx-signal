@@ -82,7 +82,7 @@ _SRC = """
 @functools.lru_cache(maxsize=32)
 def _kernel(order: int):
     return mx.fast.metal_kernel(
-        name=f"mlx_signal_lfilter_{order}",
+        name=f"mlx_signal_processing_lfilter_{order}",
         input_names=["x", "ba", "zi", "params"],
         output_names=["y", "zf"],
         source=_SRC.format(N=order, P=order + 1, STEP=_TF_STEP.format(N=order)),
@@ -208,7 +208,7 @@ _P3_SRC = """
 def _scan_kernels(order: int, L: int):
     def make(name, src, outs):
         return mx.fast.metal_kernel(
-            name=f"mlx_signal_lfilter_scan_{name}_{order}_{L}",
+            name=f"mlx_signal_processing_lfilter_scan_{name}_{order}_{L}",
             input_names={
                 "p1": ["x", "ba", "params"],
                 "p2": ["zi", "d", "AL", "params"],

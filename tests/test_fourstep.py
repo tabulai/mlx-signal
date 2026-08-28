@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_signal import _fft_core, _fourstep
+from mlx_signal_processing import _fft_core, _fourstep
 
 pytestmark = pytest.mark.skipif(
     not mx.metal.is_available(), reason="CPU backend needs no four-step path"
@@ -94,7 +94,7 @@ def test_split_chooser_properties():
 # fused three-pass kernel pipeline (power-of-two broken lengths)
 # ---------------------------------------------------------------------------
 
-from mlx_signal import _fourstep_metal  # noqa: E402
+from mlx_signal_processing import _fourstep_metal  # noqa: E402
 
 
 @pytest.mark.gpu

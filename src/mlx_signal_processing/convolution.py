@@ -2,7 +2,7 @@
 
 ``fftconvolve``/``oaconvolve``/``correlate``/``convolve`` mirror scipy.signal.
 Internally every FFT length is padded to the next power of two
-(:func:`mlx_signal.next_fast_len`), where MLX's Metal FFT is fastest, then the
+(:func:`mlx_signal_processing.next_fast_len`), where MLX's Metal FFT is fastest, then the
 result is sliced back — so prime and odd lengths don't fall off a performance
 cliff the way raw non-power-of-two FFTs do.
 """

@@ -22,7 +22,7 @@ from .resampling import decimate, resample, resample_poly, upfirdn
 from .spectral import coherence, csd, istft, periodogram, spectrogram, stft, welch
 from .windows import get_window
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "Config",

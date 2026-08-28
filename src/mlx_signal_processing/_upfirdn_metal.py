@@ -253,7 +253,7 @@ def _kernel(cx: bool, ch: bool, direct: bool, u32: bool = False):
         src = _SRC.format(HT=ht, LOADH=loadh,
                           TILE=_TILE_CPLX if ch else _TILE_REAL, **common)
     return mx.fast.metal_kernel(
-        name=f"mlx_signal_upfirdn_{int(cx)}{int(ch)}{int(direct)}"
+        name=f"mlx_signal_processing_upfirdn_{int(cx)}{int(ch)}{int(direct)}"
              + ("_u32" if u32 else ""),
         input_names=["x", "h", "params"],
         output_names=["out"],
