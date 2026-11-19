@@ -604,11 +604,14 @@ def test_resample_poly_filter_cache_unhashable_and_bounded(rng, monkeypatch):
     from mlx_signal_processing._cache import ByteBudgetCache
 
     x = rng.standard_normal(64).astype(np.float32)
-    with pytest.raises(ValueError):
-        msig.resample_poly(x, 2, 3, window=("general_cosine", [1.0, 0.5]))
-
     tiny_cache = ByteBudgetCache(4096, max_entries=3)
     monkeypatch.setattr(resampling, "_POLY_FILTER_CACHE", tiny_cache)
+
+    unhashable_win = ("kaiser", np.array(5.0))
+    out_unhash = msig.resample_poly(x, 2, 3, window=unhashable_win)
+    assert_close(out_unhash, sps.resample_poly(x, 2, 3, window=unhashable_win), rtol=2e-4)
+    assert len(tiny_cache._entries) == 0
+
     for down in (2, 3, 5, 7, 11):
         out = msig.resample_poly(x, 1, down)
         assert_close(out, sps.resample_poly(x, 1, down), rtol=2e-4)
