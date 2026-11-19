@@ -115,7 +115,7 @@ def _as_fir_taps(b, a):
     ba = to_mlx(b)
     if ba.ndim == 0:  # scalar b is a length-1 FIR, like scipy's atleast_1d
         ba = ba.reshape(1)
-    if ba.ndim != 1:
+    if ba.ndim != 1 or ba.size == 0:
         return None
     a0 = complex(a_np[0]) if np.iscomplexobj(a_np) else float(a_np[0])
     if a0 == 0:
@@ -125,16 +125,76 @@ def _as_fir_taps(b, a):
     return ba
 
 
-def _fir_causal(b: mx.array, x: mx.array) -> mx.array:
-    """Causal FIR filtering along the last axis, zero initial conditions.
+def _fir_causal(b: mx.array, x: mx.array, zi: mx.array | None = None):
+    """Causal FIR filtering along the last axis, with optional DF2T state.
 
-    Equals ``lfilter(b, 1, x)``: the first len(x) samples of the full
-    convolution.
+    Equals ``lfilter(b, 1, x, zi=zi)``. For an ``M``-tap FIR filter of order
+    ``K = M - 1``, the full linear convolution ``c = conv_full(x, b)`` of
+    length ``N + K`` gives the zero-state response in ``c[:N]`` and the
+    zero-state final delay values in ``c[N:]``. Adding ``zi`` into the first
+    ``K`` samples of ``c`` accounts for both ``N >= K`` and short chunks
+    ``N < K`` (where incoming ``zi[N:]`` survives into ``zf[:K - N]``).
     """
     n = x.shape[-1]
-    y = oaconvolve(x, b.reshape((1,) * (x.ndim - 1) + (b.shape[0],)), mode="full",
-                   axes=[x.ndim - 1])
-    return y[..., :n]
+    k = b.shape[0] - 1
+    if n == 0:
+        out_dtype = (
+            mx.complex64
+            if mx.complex64 in (x.dtype, b.dtype)
+            or (zi is not None and zi.dtype == mx.complex64)
+            else mx.float32
+        )
+        y = mx.zeros(x.shape, dtype=out_dtype)
+        if zi is None:
+            return y
+        return y, zi.astype(out_dtype) if zi.dtype != out_dtype else zi * 1
+
+    if k == 0:
+        y = x * b[0]
+        if zi is None:
+            return y
+        if zi.dtype == mx.complex64 and y.dtype != mx.complex64:
+            y = y.astype(mx.complex64)
+        return y, mx.zeros(zi.shape, dtype=y.dtype)
+
+    out_full = oaconvolve(
+        x,
+        b.reshape((1,) * (x.ndim - 1) + (b.shape[0],)),
+        mode="full",
+        axes=[x.ndim - 1],
+    )
+    if zi is None:
+        return out_full[..., :n]
+
+    if zi.dtype == mx.complex64 and out_full.dtype != mx.complex64:
+        out_full = out_full.astype(mx.complex64)
+    if n >= k:
+        head = out_full[..., :k] + zi
+        y = head if n == k else mx.concatenate([head, out_full[..., k:n]], axis=-1)
+        zf = out_full[..., n:]
+    else:
+        # Chunk shorter than filter order: incoming zi[n:] shifts into zf[:k-n]
+        y = out_full[..., :n] + zi[..., :n]
+        zf = mx.concatenate([out_full[..., n:k] + zi[..., n:], out_full[..., k:]], axis=-1)
+    return y, zf
+
+
+#: IIR recurrence work per sample-section (or sample-order) is ~8x cheaper in
+#: scipy's C loop than the FFT/convolution work that Config.gpu_min_size
+#: (default 32,768) is calibrated against, and the block-parallel scan launches
+#: three Metal kernels. Scaling IIR work by 1/8 places the default auto
+#: crossover at 262,144 sample-sections/orders (e.g. 65,536 samples for 1-ch
+#: butter-8 SOS or butter-4 TF, 8,192 samples for 8-ch) while still honoring
+#: explicit user overrides such as gpu_min_size=0 or 1.
+_IIR_WORK_DIV = 8
+
+
+def _iir_work(n_samples: int, depth: int) -> int:
+    """Effective work size passed to :func:`use_mlx` for IIR filtering."""
+    total = n_samples * depth
+    if total <= 0:
+        return 0
+    return max(1, total // _IIR_WORK_DIV)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +447,7 @@ def _lfilter_tf(b_np, a_np, x, axis, zi):
             return result_to_mlx(out[0]), result_to_mlx(out[1])
         return result_to_mlx(out)
 
-    if n == 0 or not use_mlx(xa.size * order):
+    if n == 0 or not use_mlx(_iir_work(xa.size, order)):
         return _scipy_path()
     if not kernel_ok:
         reason = ("complex filter coefficients" if complex_coeffs
@@ -473,36 +533,75 @@ def _lfilter_tf(b_np, a_np, x, axis, zi):
 def lfilter(b, a, x, axis=-1, zi=None):
     """Filter data with an IIR or FIR filter (scipy-compatible signature).
 
-    The FIR case (``len(a) == 1``) runs on the GPU as a truncated FFT
-    convolution. Transfer-function IIR (``len(a) > 1``) runs on the GPU
-    through order-N direct-form-II-transposed Metal kernels (sequential and
-    block-parallel scan, like :func:`sosfilt`) that reproduce scipy's float32
-    recurrence bit-for-bit, with the full ``zi``/``zf`` contract. Complex
-    coefficients and orders above 16 fall back to scipy with a
-    FallbackWarning; ``zi`` with ``len(a) == 1`` follows scipy's FIR
-    convolution path on the CPU.
+    The FIR case (``len(a) == 1``) runs on the GPU via overlap-add FFT
+    convolution, with full ``zi``/``zf`` state support (including chunks
+    shorter than the filter). Transfer-function IIR (``len(a) > 1``) runs on
+    the GPU through order-N direct-form-II-transposed Metal kernels (sequential
+    and block-parallel scan, like :func:`sosfilt`) that reproduce scipy's
+    float32 recurrence bit-for-bit, with the full ``zi``/``zf`` contract.
+    Complex IIR coefficients and IIR orders above 16 fall back to scipy with a
+    FallbackWarning.
     """
     taps = _as_fir_taps(b, a)
     if taps is not None:
         work = input_size(x) * max(1, taps.size)
-        if zi is not None or not use_mlx(work):
-            if zi is not None and use_mlx(work):
-                capability_fallback("lfilter", "zi initial conditions")
+        if not use_mlx(work):
             import scipy.signal as sps
 
-            out = sps.lfilter(to_numpy(b), to_numpy(a), signal_np(x), axis=axis, zi=zi)
+            zi_np = signal_np(zi) if zi is not None else None
+            out = sps.lfilter(to_numpy(b), to_numpy(a), signal_np(x), axis=axis, zi=zi_np)
             if zi is not None:
                 return result_to_mlx(out[0]), result_to_mlx(out[1])
             return result_to_mlx(out)
 
         xa = to_mlx(x)
-        moved = xa.ndim > 1 and axis not in (-1, xa.ndim - 1)
+        if xa.ndim < 1:
+            raise ValueError("x must be at least 1-D with samples along axis")
+        if not -xa.ndim <= axis < xa.ndim:
+            raise ValueError(
+                f"axis {axis} is out of range for an input with {xa.ndim} dimension(s)"
+            )
+        ax = axis % xa.ndim
+        order = taps.shape[0] - 1
+
+        zi_a = None
+        if zi is not None:
+            zi_a = to_mlx(zi)
+            if zi_a.ndim != xa.ndim:
+                raise ValueError(
+                    "Dimensions of x and zi must match, but "
+                    f"x.ndim={xa.ndim}, zi.ndim={zi_a.ndim}"
+                )
+            expected = list(xa.shape)
+            expected[ax] = order
+            ok = all(
+                zs == e or (i != ax and zs == 1)
+                for i, (zs, e) in enumerate(zip(zi_a.shape, expected, strict=True))
+            )
+            if not ok:
+                raise ValueError(
+                    f"Unexpected shape for zi: expected {tuple(expected)}, "
+                    f"found {tuple(zi_a.shape)}."
+                )
+            zi_a = mx.broadcast_to(zi_a, tuple(expected))
+
+        moved = xa.ndim > 1 and ax != xa.ndim - 1
         if moved:
-            xa = mx.moveaxis(xa, axis, -1)
-        y = _fir_causal(taps, xa)
+            xa = mx.moveaxis(xa, ax, -1)
+            if zi_a is not None:
+                zi_a = mx.moveaxis(zi_a, ax, -1)
+
+        if zi_a is None:
+            y = _fir_causal(taps, xa)
+            if moved:
+                y = mx.moveaxis(y, -1, ax)
+            return y
+
+        y, zf = _fir_causal(taps, xa, zi_a)
         if moved:
-            y = mx.moveaxis(y, -1, axis)
-        return y
+            y = mx.moveaxis(y, -1, ax)
+            zf = mx.moveaxis(zf, -1, ax)
+        return y, zf
 
     b_np, a_np = _validate_ba_np(b, a)
     return _lfilter_tf(b_np, a_np, x, axis, zi)
@@ -532,7 +631,7 @@ def _filtfilt_tf(b_np, a_np, x, axis, padtype, padlen, method, irlen):
     # small inputs would switch to scipy's native complex64 recurrence and
     # make the silent size boundary visible, exactly like sosfiltfilt's fix
     if method == "gust" or complex_coeffs:
-        if use_mlx(xa.size * max(1, order)):
+        if use_mlx(_iir_work(xa.size, max(1, order))):
             reason = ("method='gust'" if method == "gust"
                       else "complex filter coefficients")
             capability_fallback("filtfilt", reason)
@@ -885,7 +984,7 @@ def sosfilt(sos, x, axis=-1, zi=None):
             return result_to_mlx(out[0]), result_to_mlx(out[1])
         return result_to_mlx(out)
 
-    if not use_mlx(xa.size * n_sections):
+    if not use_mlx(_iir_work(xa.size, n_sections)):
         return _scipy_path()
     if not kernel_ok:
         reason = ("complex sos coefficients" if complex_sos
@@ -987,7 +1086,7 @@ def sosfiltfilt(sos, x, axis=-1, padtype="odd", padlen=None):
         # Complex coefficients have no Metal kernel. A deliberately selected
         # scipy route (or an auto-sized tiny call) is not a capability fallback
         # and should stay silent; auto-large warns and pinned MLX raises.
-        if use_mlx(xa.size * n_sections):
+        if use_mlx(_iir_work(xa.size, n_sections)):
             capability_fallback("sosfiltfilt", "complex sos coefficients")
         import scipy.signal as sps
 

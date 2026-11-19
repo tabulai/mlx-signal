@@ -561,6 +561,64 @@ def test_resample_poly_window_array(rng):
                  rtol=2e-4)
 
 
+def test_resample_poly_filter_cache_hits_and_bit_identity(rng, monkeypatch):
+    """Repeated calls with equivalent reduced ratios reuse cached FIR taps and
+    match an explicit predesigned window bit-for-bit."""
+    from mlx_signal_processing import resampling
+
+    resampling._POLY_FILTER_CACHE.clear()
+    design_calls = 0
+    orig_firwin = sps.firwin
+
+    def counting_firwin(*args, **kwargs):
+        nonlocal design_calls
+        design_calls += 1
+        return orig_firwin(*args, **kwargs)
+
+    monkeypatch.setattr(sps, "firwin", counting_firwin)
+
+    x = rng.standard_normal(1024).astype(np.float32)
+    y1 = np.array(msig.resample_poly(x, 44100, 48000))
+    y2 = np.array(msig.resample_poly(x, 147, 160))
+    assert design_calls == 1
+    np.testing.assert_array_equal(y1, y2)
+
+    # Distinct direction or window must miss the cache and design fresh taps
+    y_up = np.array(msig.resample_poly(x, 160, 147))
+    y_hann = np.array(msig.resample_poly(x, 147, 160, window="hann"))
+    assert design_calls == 3
+    assert_close(y_up, sps.resample_poly(x, 160, 147), rtol=2e-4)
+    assert_close(y_hann, sps.resample_poly(x, 147, 160, window="hann"), rtol=2e-4)
+
+    # Cached taps are read-only and bit-identical to passing predesigned taps
+    h32_cached = resampling._POLY_FILTER_CACHE.get((147, 160, ("kaiser", 5.0)))[0]
+    assert not h32_cached.flags.writeable
+    h_pre = orig_firwin(2 * 10 * 160 + 1, 1.0 / 160, window=("kaiser", 5.0))
+    y_pre = np.array(msig.resample_poly(x, 147, 160, window=h_pre))
+    np.testing.assert_array_equal(y1, y_pre)
+
+
+def test_resample_poly_filter_cache_unhashable_and_bounded(rng, monkeypatch):
+    """Unhashable window tuples bypass the cache cleanly, and entry/byte bounds hold."""
+    from mlx_signal_processing import resampling
+    from mlx_signal_processing._cache import ByteBudgetCache
+
+    x = rng.standard_normal(64).astype(np.float32)
+    tiny_cache = ByteBudgetCache(4096, max_entries=3)
+    monkeypatch.setattr(resampling, "_POLY_FILTER_CACHE", tiny_cache)
+
+    unhashable_win = ("kaiser", np.array(5.0))
+    out_unhash = msig.resample_poly(x, 2, 3, window=unhashable_win)
+    assert_close(out_unhash, sps.resample_poly(x, 2, 3, window=unhashable_win), rtol=2e-4)
+    assert len(tiny_cache._entries) == 0
+
+    for down in (2, 3, 5, 7, 11):
+        out = msig.resample_poly(x, 1, down)
+        assert_close(out, sps.resample_poly(x, 1, down), rtol=2e-4)
+    assert len(tiny_cache._entries) <= 3
+    assert tiny_cache._total <= 4096
+
+
 def test_resample_poly_complex(rng):
     x = (rng.standard_normal(1000) + 1j * rng.standard_normal(1000)).astype(np.complex64)
     assert_close(msig.resample_poly(x, 2, 3), sps.resample_poly(x, 2, 3), rtol=2e-4)

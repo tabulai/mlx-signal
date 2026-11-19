@@ -35,8 +35,8 @@ def _as_1d_f64(x) -> np.ndarray:
     return arr
 
 
-def _local_maxima(x: np.ndarray, gpu_ok: bool = False):
-    """Exact scipy `_local_maxima_1d` semantics, vectorized.
+def _local_maxima(x: np.ndarray):
+    """Exact scipy `_local_maxima_1d` semantics, vectorized on the host.
 
     A maximum is a sample (or plateau) with a strict rise before and a strict
     fall after; plateaus report their midpoint plus left/right edges.
@@ -44,25 +44,11 @@ def _local_maxima(x: np.ndarray, gpu_ok: bool = False):
     if x.size < 3:
         e = np.array([], dtype=np.intp)
         return e, e, e
-    if gpu_ok and use_mlx(x.size) and mx.metal.is_available():
-        # Compare directly.  Subtract-then-sign is not exact on Metal when two
-        # adjacent normal values differ by a subnormal ULP: the subtraction is
-        # flushed to zero even though the strict ordering is representable.
-        # Encode unordered NaN pairs as a non-sign sentinel so they break, not
-        # bridge, a possible rise-to-fall transition.
-        xa = mx.array(x.astype(np.float32))
-        left, right = xa[:-1], xa[1:]
-        unordered = mx.isnan(left) | mx.isnan(right)
-        d = np.array(
-            mx.where(unordered, 2, mx.where(right > left, 1, mx.where(right < left, -1, 0)))
-        ).astype(np.int8)
-    else:
-        left, right = x[:-1], x[1:]
-        unordered = np.isnan(left) | np.isnan(right)
-        d = np.where(
-            unordered, 2, np.where(right > left, 1, np.where(right < left, -1, 0))
-        )
-        d = d.astype(np.int8)
+    left, right = x[:-1], x[1:]
+    unordered = np.isnan(left) | np.isnan(right)
+    d = np.where(
+        unordered, 2, np.where(right > left, 1, np.where(right < left, -1, 0))
+    ).astype(np.int8)
     nz = np.nonzero(d)[0]
     if nz.size < 2:
         e = np.array([], dtype=np.intp)
@@ -73,6 +59,21 @@ def _local_maxima(x: np.ndarray, gpu_ok: bool = False):
     right_edges = nz[trans + 1].astype(np.intp)
     midpoints = (left_edges + right_edges) // 2
     return midpoints, left_edges, right_edges
+
+
+def _apply_keep(
+    peaks: np.ndarray, properties: dict[str, np.ndarray], keep: np.ndarray
+) -> tuple[np.ndarray, dict[str, np.ndarray], bool]:
+    """Filter ``peaks`` and ``properties`` by boolean mask ``keep``.
+
+    Packing surviving indices once with ``np.flatnonzero`` avoids repeated
+    branch-mispredicted boolean-mask scans across every property array.
+    Returns ``(peaks, properties, modified)``.
+    """
+    if keep.all():
+        return peaks, properties, False
+    idx = np.flatnonzero(keep)
+    return peaks[idx], {key: array[idx] for key, array in properties.items()}, True
 
 
 def _unpack_condition_args(interval, x, peaks):
@@ -198,7 +199,25 @@ def _peaks_as_intp(peaks):
     return peaks
 
 
-def _prominences(x64, f32_src, peaks, wlen):
+def _to_f32_mlx(f32_src) -> mx.array:
+    """Convert a 1-D float32 NumPy/MLX source to a contiguous float32 MLX array."""
+    if isinstance(f32_src, mx.array):
+        return f32_src
+    # A reversed float32 view (including a 1-element view) is ordinary NumPy;
+    # mx.array refuses negative-stride DLPack exports, so copy those first.
+    src = f32_src.copy() if any(s < 0 for s in f32_src.strides) else f32_src
+    return mx.array(np.ascontiguousarray(src))
+
+
+def _prominences(
+    x64,
+    f32_src,
+    peaks,
+    wlen,
+    *,
+    x32_verified: mx.array | None = None,
+    peaks_u32: mx.array | None = None,
+):
     """(prominences, left_bases, right_bases), scipy-exact on every route.
 
     GPU route (float32 source, no wlen, Metal, above the size threshold): the
@@ -215,7 +234,7 @@ def _prominences(x64, f32_src, peaks, wlen):
     from . import _peaks_metal
 
     if (
-        f32_src is None
+        (f32_src is None and x32_verified is None)
         or wlen is not None
         or not mx.metal.is_available()
         or not use_mlx(x64.size)
@@ -223,32 +242,38 @@ def _prominences(x64, f32_src, peaks, wlen):
     ):
         return sps.peak_prominences(x64, peaks, wlen=wlen)
 
-    # Metal compares denormals as zero (measured: 1e-40 == 0.0 is true
-    # on-GPU), which would corrupt base decisions in a signal scaled into the
-    # float32-denormal range; such signals keep scipy's exact CPU walk.
-    # Chunked so the |x| temporaries stay cache-resident rather than making
-    # three full-signal passes through DRAM.
-    if _has_f32_denormals(x64):
-        return sps.peak_prominences(x64, peaks, wlen=wlen)
-
-    peaks_i = _peaks_as_intp(peaks)
-    if peaks_i.size == 0:
-        return (np.array([], dtype=np.float64), np.array([], dtype=np.intp),
-                np.array([], dtype=np.intp))
-    invalid = (peaks_i < 0) | (peaks_i >= x64.size)
-    if invalid.any():
-        first = peaks_i[int(np.flatnonzero(invalid)[0])]
-        raise ValueError(f"peak {first} is not a valid index for `x`")
-
-    if isinstance(f32_src, mx.array):
-        x32 = f32_src
+    if x32_verified is not None:
+        x32 = x32_verified
     else:
-        # a reversed f32 view is ordinary numpy; mx.array refuses
-        # negative-stride DLPack exports, so ensure contiguity (a no-op for
-        # the common contiguous case — and only the values matter here)
-        src = f32_src.copy() if any(s < 0 for s in f32_src.strides) else f32_src
-        x32 = mx.array(np.ascontiguousarray(src))
-    lb, rb = _peaks_metal.prominence_bases(x32, peaks_i)
+        # Metal compares denormals as zero (measured: 1e-40 == 0.0 is true
+        # on-GPU), which would corrupt base decisions in a signal scaled into
+        # the float32-denormal range; such signals keep scipy's exact CPU walk.
+        x32 = _to_f32_mlx(f32_src)
+        has_denorm = (
+            _peaks_metal.has_f32_denormals_gpu(x32)
+            if hasattr(mx, "view")
+            else _has_f32_denormals(x64)
+        )
+        if has_denorm:
+            return sps.peak_prominences(x64, peaks, wlen=wlen)
+
+    if peaks_u32 is not None:
+        peaks_i = peaks
+        if peaks_u32.size == 0:
+            return (np.array([], dtype=np.float64), np.array([], dtype=np.intp),
+                    np.array([], dtype=np.intp))
+        lb, rb = _peaks_metal.prominence_bases(x32, peaks_u32)
+    else:
+        peaks_i = _peaks_as_intp(peaks)
+        if peaks_i.size == 0:
+            return (np.array([], dtype=np.float64), np.array([], dtype=np.intp),
+                    np.array([], dtype=np.intp))
+        invalid = (peaks_i < 0) | (peaks_i >= x64.size)
+        if invalid.any():
+            first = peaks_i[int(np.flatnonzero(invalid)[0])]
+            raise ValueError(f"peak {first} is not a valid index for `x`")
+        lb, rb = _peaks_metal.prominence_bases(x32, peaks_i)
+
     prominences = x64[peaks_i] - np.maximum(x64[lb], x64[rb])
     if np.any(prominences == 0):
         try:  # scipy keeps the class in a private module (subclasses RuntimeWarning)
@@ -306,60 +331,95 @@ def find_peaks(
     in scipy's order: plateau_size, height, threshold, distance, prominence,
     width.
     """
+    from . import _peaks_metal
+
     orig = x
     x = _as_1d_f64(x)
     if distance is not None and distance < 1:
         raise ValueError("`distance` must be greater or equal to 1")
 
     f32_src = _f32_source(orig)
+    x32_verified: mx.array | None = None
+    peaks_u32: mx.array | None = None
+    left_edges: np.ndarray | None = None
+    right_edges: np.ndarray | None = None
+
     if (
         f32_src is not None
+        and 3 <= x.size < _peaks_metal.MAX_N
         and mx.metal.is_available()
+        and hasattr(mx, "view")
         and use_mlx(x.size)
-        and _has_f32_denormals(x)
     ):
-        f32_src = None
-    peaks, left_edges, right_edges = _local_maxima(x, f32_src is not None)
+        x32 = _to_f32_mlx(f32_src)
+        need_edges = plateau_size is not None
+        gpu_res = _peaks_metal.local_maxima_gpu(x32, need_edges=need_edges)
+        if gpu_res is None:
+            # Float32 denormal detected: keep exact CPU float64 for both
+            # candidate detection and any downstream prominence search.
+            f32_src = None
+            peaks, left_edges, right_edges = _local_maxima(x)
+        else:
+            peaks_u32, left_u32, right_u32 = gpu_res
+            x32_verified = x32
+            if need_edges:
+                mx.eval(peaks_u32, left_u32, right_u32)
+                left_edges = np.array(left_u32).astype(np.intp)
+                right_edges = np.array(right_u32).astype(np.intp)
+            peaks = np.array(peaks_u32).astype(np.intp)
+    else:
+        peaks, left_edges, right_edges = _local_maxima(x)
     properties: dict[str, np.ndarray] = {}
 
     if plateau_size is not None:
         plateau_sizes = right_edges - left_edges + 1
         pmin, pmax = _unpack_condition_args(plateau_size, x, peaks)
         keep = _select_by_property(plateau_sizes, pmin, pmax)
-        peaks = peaks[keep]
         properties["plateau_sizes"] = plateau_sizes
         properties["left_edges"] = left_edges
         properties["right_edges"] = right_edges
-        properties = {key: array[keep] for key, array in properties.items()}
+        peaks, properties, changed = _apply_keep(peaks, properties, keep)
+        if changed:
+            peaks_u32 = None
 
     if height is not None:
         peak_heights = x[peaks]
         hmin, hmax = _unpack_condition_args(height, x, peaks)
         keep = _select_by_property(peak_heights, hmin, hmax)
-        peaks = peaks[keep]
         properties["peak_heights"] = peak_heights
-        properties = {key: array[keep] for key, array in properties.items()}
+        peaks, properties, changed = _apply_keep(peaks, properties, keep)
+        if changed:
+            peaks_u32 = None
 
     if threshold is not None:
         tmin, tmax = _unpack_condition_args(threshold, x, peaks)
         keep, left_thresholds, right_thresholds = _select_by_peak_threshold(
             x, peaks, tmin, tmax
         )
-        peaks = peaks[keep]
         properties["left_thresholds"] = left_thresholds
         properties["right_thresholds"] = right_thresholds
-        properties = {key: array[keep] for key, array in properties.items()}
+        peaks, properties, changed = _apply_keep(peaks, properties, keep)
+        if changed:
+            peaks_u32 = None
 
     if distance is not None:
         keep = _select_by_peak_distance(peaks, x[peaks], distance)
-        peaks = peaks[keep]
-        properties = {key: array[keep] for key, array in properties.items()}
+        peaks, properties, changed = _apply_keep(peaks, properties, keep)
+        if changed:
+            peaks_u32 = None
 
     if prominence is not None or width is not None:
         properties.update(
             zip(
                 ["prominences", "left_bases", "right_bases"],
-                _prominences(x, f32_src, peaks, wlen),
+                _prominences(
+                    x,
+                    f32_src,
+                    peaks,
+                    wlen,
+                    x32_verified=x32_verified,
+                    peaks_u32=peaks_u32,
+                ),
                 strict=True,
             )
         )
@@ -367,8 +427,7 @@ def find_peaks(
     if prominence is not None:
         pmin, pmax = _unpack_condition_args(prominence, x, peaks)
         keep = _select_by_property(properties["prominences"], pmin, pmax)
-        peaks = peaks[keep]
-        properties = {key: array[keep] for key, array in properties.items()}
+        peaks, properties, _ = _apply_keep(peaks, properties, keep)
 
     if width is not None:
         import scipy.signal as sps
@@ -391,7 +450,6 @@ def find_peaks(
         )
         wmin, wmax = _unpack_condition_args(width, x, peaks)
         keep = _select_by_property(properties["widths"], wmin, wmax)
-        peaks = peaks[keep]
-        properties = {key: array[keep] for key, array in properties.items()}
+        peaks, properties, _ = _apply_keep(peaks, properties, keep)
 
     return peaks, properties

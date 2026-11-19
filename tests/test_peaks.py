@@ -270,3 +270,62 @@ def test_find_peaks_prominence_width_bitwise(rng):
     assert set(got_props) == set(ref_props)
     for k in ref_props:
         np.testing.assert_array_equal(got_props[k], ref_props[k], err_msg=k)
+
+
+def test_gpu_local_maxima_plateaus_nans_and_block_boundaries(rng):
+    """GPU two-pass compaction matches scipy bit-for-bit on plateaus spanning
+    block boundaries, NaNs, infinities, signed zeros, and plateau_size."""
+    # Quantized signal rich in multi-sample plateaus across multiple 2048-blocks
+    q = rng.integers(0, 6, size=100_000).astype(np.float32)
+    # Inject a long plateau spanning across multiple 2048-sample blocks
+    q[4000:9000] = 10.0
+    # Inject NaNs before, inside, and after plateaus, plus +/-inf and signed zeros
+    q[12000:12010] = [0.0, 5.0, np.nan, 5.0, 0.0, 0.0, 5.0, 5.0, np.nan, 0.0]
+    q[14000:14008] = [0.0, np.inf, np.inf, 0.0, -np.inf, 0.0, -0.0, -np.inf]
+    # Exact 2048 block boundary peaks
+    q[2046:2051] = [0.0, 7.0, 7.0, 7.0, 0.0]
+    q[6142:6146] = [0.0, 8.0, 0.0, 0.0]
+
+    check_parity(q)
+    check_parity(q, plateau_size=1)
+    check_parity(q, plateau_size=(2, 5))
+    check_parity(q, plateau_size=1, prominence=1.0)
+    check_parity(q[::-1], plateau_size=1, prominence=1.0)
+
+
+def test_find_peaks_denormal_at_edges_and_single_scan(rng, monkeypatch):
+    """Denormals anywhere (including edges 0 and N-1) trigger exact fallback;
+    clean float32 signals do not run a second denormal scan in _prominences."""
+    from mlx_signal_processing import _peaks_metal
+    from mlx_signal_processing import peaks as pk
+
+    # Denormal at index 0 and index N-1
+    sub = np.array([0x007FFFFF], dtype=np.uint32).view(np.float32)[0]
+    for pos in (0, 1, 2048, 99_999):
+        x = rng.standard_normal(100_000).astype(np.float32)
+        x[pos] = sub if pos % 2 == 0 else -sub
+        check_parity(x, prominence=0.5)
+
+    # Clean float32 signal: local_maxima_gpu scans denormals in pass 1, so
+    # neither _has_f32_denormals nor has_f32_denormals_gpu should be called.
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("redundant denormal scan invoked")
+
+    monkeypatch.setattr(pk, "_has_f32_denormals", fail_if_called)
+    monkeypatch.setattr(_peaks_metal, "has_f32_denormals_gpu", fail_if_called)
+
+    x_clean = rng.standard_normal(100_000).astype(np.float32)
+    ref_p, ref_props = sps.find_peaks(x_clean.astype(np.float64), prominence=0.5)
+    got_p, got_props = msig.find_peaks(x_clean, prominence=0.5)
+    np.testing.assert_array_equal(got_p, ref_p)
+    for k in ref_props:
+        np.testing.assert_array_equal(got_props[k], ref_props[k], err_msg=k)
+
+    # Also test pre-prominence filtering (height + distance + prominence)
+    ref_p2, ref_props2 = sps.find_peaks(
+        x_clean.astype(np.float64), height=0.2, distance=5, prominence=0.5
+    )
+    got_p2, got_props2 = msig.find_peaks(x_clean, height=0.2, distance=5, prominence=0.5)
+    np.testing.assert_array_equal(got_p2, ref_p2)
+    for k in ref_props2:
+        np.testing.assert_array_equal(got_props2[k], ref_props2[k], err_msg=k)

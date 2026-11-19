@@ -111,16 +111,112 @@ def test_lfilter_iir_complex_coefficients_fall_back(rng):
                                atol=1e-5 * np.abs(ref).max())
 
 
-def test_lfilter_zi_falls_back(rng):
+def test_lfilter_fir_zi_runs_on_gpu_without_fallback(rng):
+    """FIR lfilter with zi runs natively on the GPU with no fallback warning."""
+    import warnings as _w
+
     b = np.array(msig.firwin(9, 0.3))
     x = rng.standard_normal(300).astype(np.float32)
-    zi = sps.lfilter_zi(b, [1.0]) * x[0]
+    zi = (sps.lfilter_zi(b, [1.0]) * x[0]).astype(np.float32)
     with msig.config_context(dispatch="auto", gpu_min_size=1, warn_on_fallback=True):
-        with pytest.warns(msig.FallbackWarning):
+        with _w.catch_warnings():
+            _w.simplefilter("error", msig.FallbackWarning)
             y, zf = msig.lfilter(b, [1.0], x, zi=zi)
-    y_ref, zf_ref = sps.lfilter(b, [1.0], x, zi=zi)
+    y_ref, zf_ref = sps.lfilter(b, np.array([1.0], np.float32), x, zi=zi)
     assert_close(y, y_ref)
     assert_close(zf, zf_ref)
+
+
+@pytest.mark.parametrize("n", [1, 5, 31, 32, 33, 200])
+def test_lfilter_fir_zi_chunk_lengths_including_shorter_than_filter(rng, n):
+    """FIR zi/zf must match scipy across chunks shorter than, equal to, and
+    longer than the filter order (32 for 33 taps)."""
+    b = rng.standard_normal(33).astype(np.float32)
+    a32 = np.array([1.0], np.float32)
+    x = rng.standard_normal((4, n)).astype(np.float32)
+    zi = rng.standard_normal((4, 32)).astype(np.float32)
+
+    y_ref, zf_ref = sps.lfilter(b, a32, x, axis=-1, zi=zi)
+    y, zf = msig.lfilter(b, a32, x, axis=-1, zi=zi)
+    assert tuple(y.shape) == y_ref.shape
+    assert tuple(zf.shape) == zf_ref.shape
+    assert_close(y, y_ref, rtol=1e-4, atol_frac=1e-5)
+    assert_close(zf, zf_ref, rtol=1e-4, atol_frac=1e-5)
+
+
+def test_lfilter_fir_zi_streaming_short_chunks_matches_one_shot(rng):
+    """Streaming FIR chunks shorter than the filter must carry surviving
+    incoming state across multiple calls and match one-shot filtering."""
+    b = np.array(msig.firwin(129, 0.25))  # order 128
+    a32 = np.array([1.0], np.float32)
+    x = rng.standard_normal((6, 500)).astype(np.float32)
+    zi0 = rng.standard_normal((6, 128)).astype(np.float32)
+
+    y_one, zf_one = sps.lfilter(b, a32, x, axis=-1, zi=zi0)
+
+    # First four chunks total only 85 samples (< 128), so parts of zi0 must
+    # survive through four consecutive calls into zf!
+    splits = [7, 20, 45, 85, 220]
+    state = zi0
+    parts = []
+    for chunk in np.split(x, splits, axis=-1):
+        yc, state = msig.lfilter(b, a32, chunk, axis=-1, zi=state)
+        parts.append(np.array(yc))
+    y_stream = np.concatenate(parts, axis=-1)
+    assert_close(y_stream, y_one, rtol=1e-4, atol_frac=1e-5)
+    assert_close(state, zf_one, rtol=1e-4, atol_frac=1e-5)
+
+
+def test_lfilter_fir_zi_edges_axes_broadcast_complex_and_validation(rng):
+    """Covers non-unit a[0], 1-tap FIR, axis=0, singleton-broadcast zi,
+    complex signal/taps/zi, MLX zi on all dispatch routes, and validation."""
+    import mlx.core as mx
+
+    # Non-unit a[0] and axis=0 with singleton-broadcast zi
+    b = rng.standard_normal(25).astype(np.float32)
+    a_val = np.array([2.5], np.float32)
+    x0 = rng.standard_normal((15, 4)).astype(np.float32)  # shorter than order=24
+    zi0 = rng.standard_normal((24, 1)).astype(np.float32)
+    y_ref, zf_ref = sps.lfilter(b, a_val, x0, axis=0, zi=zi0)
+    for disp in ("auto", "scipy") + (("mlx",) if HAS_GPU else ()):
+        with msig.config_context(dispatch=disp, warn_on_downcast=False):
+            y, zf = msig.lfilter(b, a_val, x0, axis=0, zi=mx.array(zi0))
+        assert_close(y, y_ref, rtol=1e-4, atol_frac=1e-5)
+        assert_close(zf, zf_ref, rtol=1e-4, atol_frac=1e-5)
+
+    # 1-tap FIR (order == 0): empty state along axis
+    b1 = np.array([3.0], np.float32)
+    zi_empty = np.zeros((3, 0), np.float32)
+    x1 = rng.standard_normal((3, 20)).astype(np.float32)
+    y1, zf1 = msig.lfilter(b1, [1.0], x1, axis=-1, zi=zi_empty)
+    assert tuple(y1.shape) == (3, 20) and tuple(zf1.shape) == (3, 0)
+    assert_close(y1, x1 * 3.0)
+
+    # Complex zi with real b and real x promotes both y and zf to complex64
+    zi_c = (rng.standard_normal((3, 24)) + 1j * rng.standard_normal((3, 24))).astype(np.complex64)
+    xr = rng.standard_normal((3, 10)).astype(np.float32)
+    yr_ref, zfr_ref = sps.lfilter(b, np.array([1.0], np.float32), xr, axis=-1, zi=zi_c)
+    yr, zfr = msig.lfilter(b, np.array([1.0], np.float32), xr, axis=-1, zi=zi_c)
+    assert yr.dtype == mx.complex64 and zfr.dtype == mx.complex64
+    assert_close(yr, yr_ref, rtol=1e-4, atol_frac=1e-5)
+    assert_close(zfr, zfr_ref, rtol=1e-4, atol_frac=1e-5)
+
+    # Complex taps and complex signal
+    bc = (rng.standard_normal(19) + 1j * rng.standard_normal(19)).astype(np.complex64)
+    xc = (rng.standard_normal((2, 12)) + 1j * rng.standard_normal((2, 12))).astype(np.complex64)
+    zic = (rng.standard_normal((2, 18)) + 1j * rng.standard_normal((2, 18))).astype(np.complex64)
+    yc_ref, zfc_ref = sps.lfilter(bc, np.array([1.0 + 0.5j], np.complex64), xc, axis=-1, zi=zic)
+    yc, zfc = msig.lfilter(bc, np.array([1.0 + 0.5j], np.complex64), xc, axis=-1, zi=zic)
+    assert_close(yc, yc_ref, rtol=1e-4, atol_frac=1e-5)
+    assert_close(zfc, zfc_ref, rtol=1e-4, atol_frac=1e-5)
+
+    # Validation errors match scipy
+    with pytest.raises(ValueError, match="Dimensions"):
+        msig.lfilter(b, [1.0], xr, axis=-1, zi=np.zeros(24, np.float32))
+    with pytest.raises(ValueError, match="Unexpected shape"):
+        msig.lfilter(b, [1.0], xr, axis=-1, zi=np.zeros((3, 20), np.float32))
+    with pytest.raises(ValueError, match="out of range"):
+        msig.lfilter(b, [1.0], xr, axis=5, zi=zi_c)
 
 
 @pytest.mark.parametrize("padtype", ["odd", "even", "constant", None])
@@ -454,6 +550,37 @@ def test_lfilter_tf_auto_routing_is_filter_invariant(rng):
         r32 = np.array(msig.lfilter(b, a, np.tile(xn, (32, 1))))[0]
     tol = 1e-6 if HAS_GPU else 0.0
     np.testing.assert_allclose(r31, r32, atol=tol * max(np.abs(r32).max(), 1e-9))
+
+
+def test_lfilter_tf_auto_dispatch_crossover(monkeypatch, rng):
+    """Auto dispatch for TF IIR mirrors sosfilt's tuned crossover."""
+    from mlx_signal_processing import _lfilter_metal
+
+    if not HAS_GPU:
+        pytest.skip("requires Metal GPU")
+
+    scan_calls = 0
+    real_scan = _lfilter_metal.lfilter_scan_gpu
+
+    def counting_scan(*args, **kwargs):
+        nonlocal scan_calls
+        scan_calls += 1
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(_lfilter_metal, "lfilter_scan_gpu", counting_scan)
+    b, a = sps.butter(4, 0.25)  # order 4
+    b32, a32 = b.astype(np.float32), a.astype(np.float32)
+
+    with msig.config_context(dispatch="auto", warn_on_downcast=False):
+        x_lo = rng.standard_normal(8192).astype(np.float32)
+        y_lo = np.array(msig.lfilter(b, a, x_lo))
+        assert scan_calls == 0
+        _assert_tf(y_lo, sps.lfilter(b32, a32, x_lo))
+
+        x_hi = rng.standard_normal(65_536).astype(np.float32)
+        y_hi = np.array(msig.lfilter(b, a, x_hi))
+        assert scan_calls == 1
+        _assert_tf(y_hi, sps.lfilter(b32, a32, x_hi), tol=1e-5)
 
 
 def test_lfilter_tf_scan_and_sequential_kernels_agree(rng):

@@ -162,6 +162,47 @@ def test_sosfilt_single_channel_uses_scan_under_auto(rng):
                                atol=1e-5 * np.abs(np.array(out)).max())
 
 
+def test_sosfilt_auto_dispatch_crossover(monkeypatch, rng):
+    """Auto dispatch keeps short single-channel IIR on scipy and routes to
+    Metal scan once sample-sections cross the tuned crossover (262,144)."""
+    from mlx_signal_processing import _sosfilt_metal
+
+    if not HAS_GPU:
+        pytest.skip("requires Metal GPU")
+
+    scan_calls = 0
+    real_scan = _sosfilt_metal.sosfilt_scan_gpu
+
+    def counting_scan(*args, **kwargs):
+        nonlocal scan_calls
+        scan_calls += 1
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(_sosfilt_metal, "sosfilt_scan_gpu", counting_scan)
+    sos = sps.butter(8, 0.2, output="sos")  # 4 sections
+
+    with msig.config_context(dispatch="auto", warn_on_downcast=False):
+        # 1ch x 8192 (32k sample-sections) and 1ch x 65535 (< 256k): stay on scipy
+        y_8k = np.array(msig.sosfilt(sos, rng.standard_normal(8192).astype(np.float32)))
+        x_lo = rng.standard_normal(65_535).astype(np.float32)
+        y_lo = np.array(msig.sosfilt(sos, x_lo))
+        assert scan_calls == 0
+        assert y_8k.shape == (8192,)
+        np.testing.assert_allclose(y_lo, _f32_ref(sos, x_lo), rtol=1e-6,
+                                   atol=1e-6 * np.abs(y_lo).max())
+
+        # 1ch x 65536 (262,144) and 8ch x 8192 (262,144): engage GPU scan
+        x_hi = rng.standard_normal(65_536).astype(np.float32)
+        y_hi = np.array(msig.sosfilt(sos, x_hi))
+        x_8ch = rng.standard_normal((8, 8192)).astype(np.float32)
+        y_8ch = np.array(msig.sosfilt(sos, x_8ch))
+        assert scan_calls == 2
+        np.testing.assert_allclose(y_hi, _f32_ref(sos, x_hi), rtol=1e-5,
+                                   atol=1e-5 * np.abs(y_hi).max())
+        np.testing.assert_allclose(y_8ch, _f32_ref(sos, x_8ch), rtol=1e-5,
+                                   atol=1e-5 * np.abs(y_8ch).max())
+
+
 def test_sosfilt_short_signal_sequential_kernel(rng):
     """n below the scan threshold exercises the per-channel-sequential kernel."""
     sos = FILTERS[1]
@@ -352,7 +393,7 @@ def test_old_scipy_scan_unsafe_auto_stays_on_scipy(monkeypatch, rng):
     np.testing.assert_array_equal(out, ref)
 
 
-@pytest.mark.parametrize("n", [16_383, 16_384])  # straddles the auto threshold
+@pytest.mark.parametrize("n", [131_071, 131_072])  # straddles the auto threshold (S=2)
 def test_sosfilt_complex_zi_real_x(rng, n):
     """scipy accepts real x with complex zi (complex output); so must every
     dispatch route — the Metal path previously raised above the threshold."""

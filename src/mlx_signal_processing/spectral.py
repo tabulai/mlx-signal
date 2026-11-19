@@ -199,6 +199,7 @@ def _spectral_helper(
     boundary=None,
     padded=False,
     defer_onesided_factor=False,
+    reduce_mean=False,
 ):
     """MLX port of scipy.signal._spectral_helper (identical layout and scaling).
 
@@ -322,16 +323,24 @@ def _spectral_helper(
         and _stft_metal.eligible(x, nperseg, nfft, sides, detrend)
     ):
         # fused two-signal sweep: both FFTs and the conjugate product in one kernel
-        result = _stft_metal.csd_frames(x, y, win, nperseg, nstep, detrend)
+        if reduce_mean:
+            result = _stft_metal.csd_mean(x, y, win, nperseg, nstep, detrend)[..., None, :]
+        else:
+            result = _stft_metal.csd_frames(x, y, win, nperseg, nstep, detrend)
     elif not same_data:
         fx, _ = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides)
         fy, _ = _fft_frames(y, win, detrend, nperseg, nstep, nfft, sides)
         result = mx.conj(fx) * fy
     elif mode == "psd":
-        fx, is_power = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides,
-                                   want_power=want_power)
-        # |F|^2: either straight from the fused kernel, or one compiled pass
-        result = fx if is_power else _fused_power(fx)
+        if reduce_mean and _stft_metal.eligible(x, nperseg, nfft, sides, detrend):
+            result = _stft_metal.rfft_power_mean(
+                x, win, nperseg, nstep, detrend
+            )[..., None, :]
+        else:
+            fx, is_power = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides,
+                                       want_power=want_power)
+            # |F|^2: either straight from the fused kernel, or one compiled pass
+            result = fx if is_power else _fused_power(fx)
     else:
         fx, _ = _fft_frames(x, win, detrend, nperseg, nstep, nfft, sides)
         result = fx
@@ -454,6 +463,7 @@ def csd(
         axis,
         mode="psd",
         defer_onesided_factor=True,
+        reduce_mean=(average == "mean"),
     )
     if pxy.ndim >= 1 and pxy.shape[-1] > 1:
         if average == "median":
@@ -596,12 +606,9 @@ def coherence(
                     xa = mx.moveaxis(xa, ax, -1)
                     ya = mx.moveaxis(ya, ax, -1)
                 win = mx.array(win_np.astype(np.float32))
-                pxx, pyy, pxy = _stft_metal.coherence_frames(
+                pxx, pyy, pxy = _stft_metal.coherence_mean(
                     xa, ya, win, nps, nps - nov, detrend
                 )
-                pxx = mx.mean(pxx, axis=-2)
-                pyy = mx.mean(pyy, axis=-2)
-                pxy = mx.mean(pxy, axis=-2)
                 a = mx.abs(pxy)
                 cxy = a * a / pxx / pyy
                 if cxy.ndim > 1 and ax != cxy.ndim - 1:
@@ -756,6 +763,64 @@ def _overlap_add(xsubs_t: mx.array, outputlength: int, nstep: int) -> mx.array:
 _NOLA_CACHE: dict = {}
 
 
+def _istft_axes(shape: tuple[int, ...], freq_axis: int, time_axis: int):
+    """Validate and normalize istft axes, returning (freq_ax, time_ax, perm).
+
+    ``perm`` rearranges the input into frame-major ``(..., time, freq)`` order
+    while preserving the relative order of all outer batch axes.
+    """
+    ndim = len(shape)
+    if ndim < 2:
+        raise ValueError("Input stft must be at least 2d!")
+    if freq_axis == time_axis:
+        raise ValueError("Must specify differing time and frequency axes!")
+    # Validate bounds before normalizing so out-of-range axes raise IndexError
+    _ = shape[time_axis]
+    _ = shape[freq_axis]
+    freq_ax = freq_axis + ndim if freq_axis < 0 else freq_axis
+    time_ax = time_axis + ndim if time_axis < 0 else time_axis
+    if freq_ax == time_ax:
+        raise ValueError("Must specify differing time and frequency axes!")
+    zouter = [i for i in range(ndim) if i != freq_ax and i != time_ax]
+    return freq_ax, time_ax, zouter + [time_ax, freq_ax]
+
+
+def _istft_numpy_layout(
+    arr: np.ndarray, perm: list[int]
+) -> tuple[np.ndarray, list[int] | None]:
+    """Select a NumPy view and optional GPU permutation to reach ``perm``.
+
+    ``scipy.signal.stft`` stores each frame's frequency bins contiguously, so
+    transposing to ``(..., time, freq)`` yields a zero-copy C-contiguous view.
+    Handing that view to :func:`to_mlx` eliminates both the CPU transpose copy
+    in ``np.ascontiguousarray`` and the follow-up GPU axis swap. When the input
+    is already contiguous in another axis order (e.g. caller-copied C-order or
+    Fortran-order), transfer that contiguous view directly and permute on GPU.
+    """
+    z_view = np.transpose(arr, perm)
+    if z_view.flags.c_contiguous:
+        return z_view, None
+    if arr.flags.c_contiguous:
+        return arr, perm
+
+    ndim = arr.ndim
+    c_order = sorted(range(ndim), key=lambda i: (arr.shape[i] > 1, -arr.strides[i]))
+    z_c = np.transpose(arr, c_order)
+    if z_c.flags.c_contiguous:
+        inv_c = [0] * ndim
+        for pos, ax in enumerate(c_order):
+            inv_c[ax] = pos
+        gpu_perm = [inv_c[ax] for ax in perm]
+        return z_c, None if gpu_perm == list(range(ndim)) else gpu_perm
+
+    # Non-contiguous in every axis order (e.g. strided or reversed slices):
+    # to_mlx must copy on CPU anyway; pack directly into frame-major order when
+    # that has the smaller-or-equal inner stride so no GPU swap is needed.
+    if abs(z_view.strides[-1]) <= abs(arr.strides[-1]):
+        return z_view, None
+    return arr, perm
+
+
 def istft(
     Zxx,
     fs=1.0,
@@ -792,23 +857,33 @@ def istft(
         )
         return result_to_mlx(t), result_to_mlx(x)
 
-    zxx = to_mlx(Zxx)
-    if zxx.dtype != mx.complex64:
-        zxx = zxx.astype(mx.complex64)
     freq_axis = int(freq_axis)
     time_axis = int(time_axis)
 
-    if zxx.ndim < 2:
-        raise ValueError("Input stft must be at least 2d!")
-    if freq_axis == time_axis:
-        raise ValueError("Must specify differing time and frequency axes!")
+    # Normalize into frame-major (..., time, freq) layout; for NumPy arrays
+    # normalize axes before to_mlx so scipy.signal.stft's contiguous frame
+    # layout transfers without a CPU transpose copy.
+    if isinstance(Zxx, np.ndarray) and Zxx.ndim >= 2:
+        freq_ax, time_ax, perm = _istft_axes(Zxx.shape, freq_axis, time_axis)
+        z_in, gpu_perm = _istft_numpy_layout(Zxx, perm)
+        zxx = to_mlx(z_in)
+    else:
+        zxx = to_mlx(Zxx)
+        freq_ax, time_ax, perm = _istft_axes(zxx.shape, freq_axis, time_axis)
+        gpu_perm = None if perm == list(range(zxx.ndim)) else perm
 
-    nseg = zxx.shape[time_axis]
+    if gpu_perm is not None:
+        zxx = mx.transpose(zxx, gpu_perm)
+    if zxx.dtype != mx.complex64:
+        zxx = zxx.astype(mx.complex64)
+
+    nseg = zxx.shape[-2]
+    nf = zxx.shape[-1]
 
     if input_onesided:
-        n_default = 2 * (zxx.shape[freq_axis] - 1)
+        n_default = 2 * (nf - 1)
     else:
-        n_default = zxx.shape[freq_axis]
+        n_default = nf
 
     if nperseg is None:
         nperseg = n_default
@@ -831,17 +906,6 @@ def istft(
     if noverlap >= nperseg:
         raise ValueError("noverlap must be less than nperseg.")
     nstep = nperseg - noverlap
-
-    # rearrange so the layout is (..., freq, time)
-    if time_axis != zxx.ndim - 1 or freq_axis != zxx.ndim - 2:
-        if freq_axis < 0:
-            freq_axis = zxx.ndim + freq_axis
-        if time_axis < 0:
-            time_axis = zxx.ndim + time_axis
-        zouter = list(range(zxx.ndim))
-        for ax in sorted([time_axis, freq_axis], reverse=True):
-            zouter.pop(ax)
-        zxx = mx.transpose(zxx, zouter + [freq_axis, time_axis])
 
     if isinstance(window, str | tuple):
         key = tuple(window) if isinstance(window, tuple) else window
@@ -866,27 +930,24 @@ def istft(
         # fused pair: per-segment inverse Stockham rfft + windowing in one
         # kernel, then gather-based overlap-add (with the norm divide folded in)
         m1 = nperseg // 2 + 1
-        nf = zxx.shape[-2]
         if nf > m1:
-            z = zxx[..., :m1, :]
+            z = zxx[..., :m1]
         elif nf < m1:
             z = mx.concatenate(
-                [zxx, mx.zeros(zxx.shape[:-2] + (m1 - nf, nseg), dtype=zxx.dtype)],
-                axis=-2,
+                [zxx, mx.zeros(zxx.shape[:-1] + (m1 - nf,), dtype=zxx.dtype)],
+                axis=-1,
             )
         else:
             z = zxx
-        x, norm = _stft_metal.istft_frames(
-            mx.swapaxes(z, -2, -1), win_np, scale, nperseg, nstep
-        )
+        x, norm = _stft_metal.istft_frames(z, win_np, scale, nperseg, nstep)
         divided = True
     else:
         ifunc = _sfft.irfft if input_onesided else _sfft.ifft
-        xsubs = ifunc(zxx, n=nfft, axis=-2)[..., :nperseg, :]
+        xsubs = ifunc(zxx, n=nfft, axis=-1)[..., :nperseg]
         xsubs = xsubs * mx.array(scale, dtype=mx.float32)
 
         win = mx.array(win_np.astype(np.float32))
-        xsubs_t = mx.swapaxes(xsubs, -2, -1) * win  # (..., nseg, nperseg)
+        xsubs_t = xsubs * win  # (..., nseg, nperseg)
         x = _overlap_add(xsubs_t, outputlength, nstep)
 
         w2 = win * win
@@ -923,10 +984,9 @@ def istft(
             x = mx.real(x)
 
     n_out = x.shape[-1]
-    if x.ndim > 1 and time_axis != zxx.ndim - 1:
-        if freq_axis < time_axis:
-            time_axis -= 1
-        x = mx.moveaxis(x, -1, time_axis)
+    out_time_axis = time_ax - (1 if freq_ax < time_ax else 0)
+    if x.ndim > 1 and out_time_axis != x.ndim - 1:
+        x = mx.moveaxis(x, -1, out_time_axis)
 
     time = mx.arange(n_out, dtype=mx.float32) / float(fs)
     return time, x
