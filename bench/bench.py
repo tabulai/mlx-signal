@@ -252,11 +252,18 @@ def build_cases(quick: bool) -> list[Case]:
     # --- filtering ----------------------------------------------------------
     x = sig((64, 1 << 20)) if not quick else sig((8, 1 << 18))
     b = np.array(msig.firwin(257, 0.1))
+    a32 = np.array([1.0], dtype=f32)
     cases.append(Case(
         "lfilter (FIR)", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, 257 taps",
         lambda x=x, b=b: sps.lfilter(b, [1.0], x, axis=-1),
         lambda x=x, b=b: msig.lfilter(b, [1.0], x, axis=-1),
         (x, b),
+    ))
+    cases.append(Case(
+        "lfilter (FIR, f32 a)", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, 257 taps, f32",
+        lambda x=x, b=b, a=a32: sps.lfilter(b, a, x, axis=-1),
+        lambda x=x, b=b, a=a32: msig.lfilter(b, a, x, axis=-1),
+        (x, b, a32),
     ))
 
     cases.append(Case(
@@ -264,6 +271,12 @@ def build_cases(quick: bool) -> list[Case]:
         lambda x=x, b=b: sps.filtfilt(b, [1.0], x, axis=-1),
         lambda x=x, b=b: msig.filtfilt(b, [1.0], x, axis=-1),
         (x, b),
+    ))
+    cases.append(Case(
+        "filtfilt (FIR, f32 a)", f"{x.shape[0]}ch x 2^{int(np.log2(x.shape[1]))}, 257 taps, f32",
+        lambda x=x, b=b, a=a32: sps.filtfilt(b, a, x, axis=-1),
+        lambda x=x, b=b, a=a32: msig.filtfilt(b, a, x, axis=-1),
+        (x, b, a32),
     ))
 
     # --- istft (inverse-Stockham + gather-OLA kernel pair) -------------------
@@ -431,8 +444,12 @@ def _device_variant(case: Case, mx_inputs):
         return lambda: msig.hilbert(a[0])
     if n == "lfilter (FIR)":
         return lambda: msig.lfilter(a[1], [1.0], a[0], axis=-1)
+    if n == "lfilter (FIR, f32 a)":
+        return lambda: msig.lfilter(a[1], a[2], a[0], axis=-1)
     if n == "filtfilt (FIR)":
         return lambda: msig.filtfilt(a[1], [1.0], a[0], axis=-1)
+    if n == "filtfilt (FIR, f32 a)":
+        return lambda: msig.filtfilt(a[1], a[2], a[0], axis=-1)
     if n == "istft":
         return lambda: msig.istft(a[0], nperseg=1024)
     if n == "csd":

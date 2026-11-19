@@ -15,6 +15,7 @@ import numpy as np
 
 from . import _fft_core as _sfft
 from ._array import input_size, result_to_mlx, signal_np, to_mlx, to_numpy
+from ._cache import ByteBudgetCache
 from ._config import capability_fallback, use_mlx
 from ._upfirdn_metal import upfirdn_gpu
 from .convolution import fftconvolve
@@ -434,6 +435,52 @@ def upfirdn(h, x, up=1, down=1, axis=-1, mode="constant", cval=0):
     return out
 
 
+#: bounded LRU for resample_poly FIR designs, keyed by reduced (up, down, window).
+#: Capped by both bytes (8 MiB) and entry count (256) so block-based audio stays
+#: warm while sweeps across large or many ratios stay strictly bounded.
+_POLY_FILTER_CACHE = ByteBudgetCache(8 << 20, max_entries=256)
+
+
+def _design_poly_filter(
+    up: int, down: int, window
+) -> tuple[np.ndarray, int, int, int]:
+    """Return ``(h32_pre_padded, half_len, n_pre_pad, n_pre_remove)`` for a
+    reduced ``(up, down)`` ratio and ``firwin`` window specification.
+
+    The cached ``float32`` tap array already incorporates the ``* up`` gain and
+    leading ``n_pre_pad`` zeros (computed in float64 to match scipy's rounding)
+    and is read-only.
+    """
+    key: tuple | None = (up, down, window)
+    try:
+        cached = _POLY_FILTER_CACHE.get(key)
+    except TypeError:
+        key = None
+        cached = None
+    if cached is not None:
+        return cached
+
+    from scipy.signal import firwin
+
+    max_rate = max(up, down)
+    f_c = 1.0 / max_rate
+    half_len = 10 * max_rate
+    h_np = np.asarray(firwin(2 * half_len + 1, f_c, window=window), dtype=np.float64)
+    h_np = h_np * up
+    n_pre_pad = down - half_len % down
+    n_pre_remove = (half_len + n_pre_pad) // down
+
+    h32 = np.empty(n_pre_pad + h_np.size, dtype=np.float32)
+    h32[:n_pre_pad] = 0.0
+    h32[n_pre_pad:] = h_np
+    h32.setflags(write=False)
+
+    entry = (h32, half_len, n_pre_pad, n_pre_remove)
+    if key is not None:
+        _POLY_FILTER_CACHE.put(key, entry, h32.nbytes)
+    return entry
+
+
 def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant",
                   cval=None):
     """Polyphase resampling by the rational factor ``up/down`` (scipy-compatible).
@@ -467,12 +514,9 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
     n_out = n_out // down + bool(n_out % down)
 
     if isinstance(window, str | tuple):
-        from scipy.signal import firwin
-
-        max_rate = max(up, down)
-        f_c = 1.0 / max_rate
-        half_len = 10 * max_rate
-        h_np = np.asarray(firwin(2 * half_len + 1, f_c, window=window), dtype=np.float64)
+        h32_base, half_len, n_pre_pad, n_pre_remove = _design_poly_filter(
+            up, down, window
+        )
     else:
         w_np = to_numpy(window)
         h_np = np.array(w_np, dtype=np.complex128 if np.iscomplexobj(w_np)
@@ -480,7 +524,10 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
         if h_np.ndim != 1:
             raise ValueError("window must be 1-D")
         half_len = (h_np.size - 1) // 2
-    h_np = h_np * up
+        h_np = h_np * up
+        n_pre_pad = down - half_len % down
+        n_pre_remove = (half_len + n_pre_pad) // down
+        h32_base = None
 
     # padtype is validated after axis and window, matching scipy's error order
     stat_padtypes = ("mean", "median", "maximum", "minimum")
@@ -493,21 +540,28 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
     # Zero-pad the filter so output samples land at the center.  Do this before
     # the statistical-background branch so an exceptional SciPy fallback can
     # honor the actual size/dispatch decision of the filtering work.
-    n_pre_pad = down - half_len % down
     n_post_pad = 0
-    n_pre_remove = (half_len + n_pre_pad) // down
-    while _output_len(len(h_np) + n_pre_pad + n_post_pad, n_in, up, down) < (
+    base_len = len(h32_base) if h32_base is not None else len(h_np) + n_pre_pad
+    while _output_len(base_len + n_post_pad, n_in, up, down) < (
         n_out + n_pre_remove
     ):
         n_post_pad += 1
-    h_full = np.concatenate([
-        np.zeros(n_pre_pad, dtype=h_np.dtype), h_np,
-        np.zeros(n_post_pad, dtype=h_np.dtype),
-    ])
+    if h32_base is not None:
+        if n_post_pad:
+            h32 = np.concatenate([h32_base, np.zeros(n_post_pad, dtype=np.float32)])
+        else:
+            h32 = h32_base
+    else:
+        h_full = np.concatenate([
+            np.zeros(n_pre_pad, dtype=h_np.dtype), h_np,
+            np.zeros(n_post_pad, dtype=h_np.dtype),
+        ])
+        h32 = h_full.astype(np.complex64 if np.iscomplexobj(h_full) else np.float32)
+
     n_pre_remove_end = n_pre_remove + n_out
-    filter_n_out = _output_len(len(h_full), n_in, up, down)
+    filter_n_out = _output_len(len(h32), n_in, up, down)
     batch = xa.size // n_in if n_in else 0
-    filter_work = batch * filter_n_out * max(1, len(h_full) // up)
+    filter_work = batch * filter_n_out * max(1, len(h32) // up)
 
     background = None
     upfirdn_mode, upfirdn_cval = "constant", 0
@@ -565,7 +619,6 @@ def resample_poly(x, up, down, axis=0, window=("kaiser", 5.0), padtype="constant
         upfirdn_mode = padtype
         upfirdn_cval = 0 if cval is None else cval
 
-    h32 = h_full.astype(np.complex64 if np.iscomplexobj(h_full) else np.float32)
     y = upfirdn(h32, xa, up, down, axis=axis, mode=upfirdn_mode, cval=upfirdn_cval)
     keep = [slice(None)] * y.ndim
     keep[axis] = slice(n_pre_remove, n_pre_remove_end)

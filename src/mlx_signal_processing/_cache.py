@@ -13,8 +13,9 @@ from collections import OrderedDict
 
 
 class ByteBudgetCache:
-    def __init__(self, budget_bytes: int):
+    def __init__(self, budget_bytes: int, max_entries: int | None = None):
         self.budget = int(budget_bytes)
+        self.max_entries = None if max_entries is None else int(max_entries)
         self._entries: OrderedDict[tuple, tuple[object, int]] = OrderedDict()
         self._total = 0
 
@@ -28,13 +29,22 @@ class ByteBudgetCache:
     def put(self, key: tuple, value, nbytes: int) -> None:
         if int(nbytes) > self.budget:
             return  # oversized entries are returned to the caller uncached
+        if self.max_entries is not None and self.max_entries <= 0:
+            return
         if key in self._entries:
             self._total -= self._entries.pop(key)[1]
         self._entries[key] = (value, int(nbytes))
         self._total += int(nbytes)
-        while self._total > self.budget and len(self._entries) > 1:
+        while (
+            self._total > self.budget
+            or (self.max_entries is not None and len(self._entries) > self.max_entries)
+        ) and len(self._entries) > 1:
             _, (_, freed) = self._entries.popitem(last=False)
             self._total -= freed
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._total = 0
 
 
 #: shared budget for all FFT twiddle/coefficient vectors (complex64). Sized

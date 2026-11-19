@@ -420,6 +420,333 @@ def coherence_frames(x, y, win, nperseg, hop, detrend):
 
 
 # ---------------------------------------------------------------------------
+# grouped-frame accumulation for mean spectral estimates (welch, csd, coherence)
+# ---------------------------------------------------------------------------
+
+#: target at least this many threadgroups across all channels to saturate the
+#: GPU, while capping per-group sequential float32 accumulation at 64 frames
+#: (slashing peak memory by up to 64x while keeping fp32 summation tight)
+_MEAN_TARGET_GROUPS = 2048
+_MEAN_MAX_GROUP = 64
+
+
+def _group_params(B: int, nseg: int) -> tuple[int, int]:
+    """Return ``(group_size, ngroups)`` for ``B`` channels and ``nseg`` frames."""
+    if nseg <= 1:
+        return 1, nseg
+    target_per_row = max(1, -(-_MEAN_TARGET_GROUPS // max(1, B)))
+    group_size = min(nseg, _MEAN_MAX_GROUP, max(1, -(-nseg // target_per_row)))
+    ngroups = -(-nseg // group_size)
+    return group_size, ngroups
+
+
+def _reduce_groups(arr: mx.array, batch_shape: tuple[int, ...], ngroups: int,
+                   width: int, nseg: int, is_complex: bool) -> mx.array:
+    """Reduce ``(B * ngroups, width)`` group partial sums to ``(*batch, M+1)`` means."""
+    arr = arr.reshape(batch_shape + (ngroups, width))
+    if ngroups > 1:
+        arr = mx.sum(arr, axis=-2)
+    else:
+        arr = arr.reshape(batch_shape + (width,))
+    if nseg > 1:
+        arr = arr * mx.array(1.0 / float(nseg), dtype=mx.float32)
+    if is_complex:
+        return mx.view(arr, mx.complex64)
+    return arr
+
+
+_SUM_SRC = """
+    uint tid = thread_index_in_threadgroup;
+    uint grp = threadgroup_position_in_grid.y;
+    int n          = params[0];
+    int hop        = params[1];
+    int nseg       = params[2];
+    int ngroups    = params[3];
+    int group_size = params[4];
+    int total_grps = params[5];
+    if ((int)grp >= total_grps) return;
+
+    int row  = (int)grp / ngroups;
+    int g_in = (int)grp - row * ngroups;
+    int s_lo = g_in * group_size;
+    int s_hi = min(nseg, s_lo + group_size);
+
+    const device float* xrow = x + (long)row * n;
+    const device float2* twf = (const device float2*)tw;
+    const device float2* utf = (const device float2*)ut;
+
+    threadgroup float2 buf0[{M}];
+    threadgroup float2 buf1[{M}];
+{RED_DECL}
+    threadgroup float2* Z;
+
+    float pwr[{KMAX}];
+    for (int i = 0; i < {KMAX}; ++i) pwr[i] = 0.0f;
+
+    for (int seg = s_lo; seg < s_hi; ++seg) {{
+        const device float* xseg = xrow + (long)seg * hop;
+{LOAD_BLOCK}
+{FFT}
+        for (int i = 0; i < {KMAX}; ++i) {{
+            int k = (int)tid + i * {T};
+            if (k <= {M}) {{
+                float2 Xk = untangle(k, Z, utf);
+                pwr[i] += Xk.x * Xk.x + Xk.y * Xk.y;
+            }}
+        }}
+        if (seg + 1 < s_hi) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    device float* orow = out + (long)grp * ({M} + 1);
+    for (int i = 0; i < {KMAX}; ++i) {{
+        int k = (int)tid + i * {T};
+        if (k <= {M}) orow[k] = pwr[i];
+    }}
+"""
+
+
+@functools.lru_cache(maxsize=32)
+def _power_sum_kernel(N: int, detrend: bool):
+    M = N // 2
+    S = int(math.log2(M))
+    T = min(256, max(32, M // 2))
+    kmax = -(-(M + 1) // T)
+    src = _SUM_SRC.format(
+        M=M, T=T, KMAX=kmax,
+        RED_DECL=f"    threadgroup float red[{T}];" if detrend else "",
+        LOAD_BLOCK=_pair_load("xseg", N, M, T, detrend),
+        FFT=_PAIR_FFT.format(M=M, S=S, T=T),
+    )
+    kern = mx.fast.metal_kernel(
+        name=f"mlx_signal_processing_welch_sum_{N}_{int(detrend)}",
+        input_names=["x", "win", "tw", "ut", "params"],
+        output_names=["out"],
+        source=src,
+        header=_HEADER.format(M=M),
+    )
+    return kern, T, M
+
+
+def rfft_power_mean(x: mx.array, win: mx.array, nperseg: int, hop: int,
+                    detrend) -> mx.array:
+    """Mean windowed |rfft|^2 over segments, accumulated in groups on GPU.
+
+    Returns ``(..., nperseg//2 + 1)`` float32 without materializing the full
+    per-frame power tensor. ``win`` must already carry any scale factor.
+    """
+    n = x.shape[-1]
+    nseg = (n - nperseg) // hop + 1
+    batch_shape = x.shape[:-1]
+    x2 = x.reshape(-1, n)
+    B = x2.shape[0]
+    group_size, ngroups = _group_params(B, nseg)
+    total_grps = B * ngroups
+
+    do_detrend = detrend in ("constant", "c")
+    kern, T, M = _power_sum_kernel(nperseg, do_detrend)
+    tw, ut = _tables(nperseg)
+    params = mx.array([n, hop, nseg, ngroups, group_size, total_grps], dtype=mx.int32)
+
+    (out,) = kern(
+        inputs=[x2, win, tw, ut, params],
+        grid=(T, total_grps, 1),
+        threadgroup=(T, 1, 1),
+        output_shapes=[(total_grps, M + 1)],
+        output_dtypes=[mx.float32],
+    )
+    return _reduce_groups(out, batch_shape, ngroups, M + 1, nseg, is_complex=False)
+
+
+_PAIR_SUM_DECL_CSD = """
+    float2 acc_xy[{KMAX}];
+    for (int i = 0; i < {KMAX}; ++i) acc_xy[i] = float2(0.0f, 0.0f);
+"""
+
+_PAIR_SUM_STEP_CSD = """
+        for (int i = 0; i < {KMAX}; ++i) {{
+            int k = (int)tid + i * {T};
+            if (k > {M}) continue;
+            float2 Xk = hold[i];
+            float2 Yk = untangle(k, Z, utf);
+            acc_xy[i] += float2(Xk.x * Yk.x + Xk.y * Yk.y, Xk.x * Yk.y - Xk.y * Yk.x);
+        }}
+"""
+
+_PAIR_SUM_OUT_CSD = """
+    device float* orow = out + (long)grp * (2 * ({M} + 1));
+    for (int i = 0; i < {KMAX}; ++i) {{
+        int k = (int)tid + i * {T};
+        if (k > {M}) continue;
+        orow[2 * k]     = acc_xy[i].x;
+        orow[2 * k + 1] = acc_xy[i].y;
+    }}
+"""
+
+_PAIR_SUM_DECL_TRIO = """
+    float acc_xx[{KMAX}];
+    float acc_yy[{KMAX}];
+    float2 acc_xy[{KMAX}];
+    for (int i = 0; i < {KMAX}; ++i) {{
+        acc_xx[i] = 0.0f;
+        acc_yy[i] = 0.0f;
+        acc_xy[i] = float2(0.0f, 0.0f);
+    }}
+"""
+
+_PAIR_SUM_STEP_TRIO = """
+        for (int i = 0; i < {KMAX}; ++i) {{
+            int k = (int)tid + i * {T};
+            if (k > {M}) continue;
+            float2 Xk = hold[i];
+            float2 Yk = untangle(k, Z, utf);
+            acc_xx[i] += Xk.x * Xk.x + Xk.y * Xk.y;
+            acc_yy[i] += Yk.x * Yk.x + Yk.y * Yk.y;
+            acc_xy[i] += float2(Xk.x * Yk.x + Xk.y * Yk.y, Xk.x * Yk.y - Xk.y * Yk.x);
+        }}
+"""
+
+_PAIR_SUM_OUT_TRIO = """
+    device float* orow = pxy + (long)grp * (2 * ({M} + 1));
+    for (int i = 0; i < {KMAX}; ++i) {{
+        int k = (int)tid + i * {T};
+        if (k > {M}) continue;
+        pxx[(long)grp * ({M} + 1) + k] = acc_xx[i];
+        pyy[(long)grp * ({M} + 1) + k] = acc_yy[i];
+        orow[2 * k]     = acc_xy[i].x;
+        orow[2 * k + 1] = acc_xy[i].y;
+    }}
+"""
+
+_PAIR_SUM_SRC = """
+    uint tid = thread_index_in_threadgroup;
+    uint grp = threadgroup_position_in_grid.y;
+    int n          = params[0];
+    int hop        = params[1];
+    int nseg       = params[2];
+    int ngroups    = params[3];
+    int group_size = params[4];
+    int total_grps = params[5];
+    if ((int)grp >= total_grps) return;
+
+    int row  = (int)grp / ngroups;
+    int g_in = (int)grp - row * ngroups;
+    int s_lo = g_in * group_size;
+    int s_hi = min(nseg, s_lo + group_size);
+
+    const device float* xrow = xa + (long)row * n;
+    const device float* yrow = xb + (long)row * n;
+    const device float2* twf = (const device float2*)tw;
+    const device float2* utf = (const device float2*)ut;
+
+    threadgroup float2 buf0[{M}];
+    threadgroup float2 buf1[{M}];
+{RED_DECL}
+    threadgroup float2* Z;
+    float2 hold[{KMAX}];
+{ACC_DECL}
+
+    for (int seg = s_lo; seg < s_hi; ++seg) {{
+        const device float* xseg = xrow + (long)seg * hop;
+        const device float* yseg = yrow + (long)seg * hop;
+
+{LOAD_X}
+{FFT}
+        for (int i = 0; i < {KMAX}; ++i) {{
+            int k = (int)tid + i * {T};
+            hold[i] = (k <= {M}) ? untangle(k, Z, utf) : float2(0.0f, 0.0f);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+{LOAD_Y}
+{FFT}
+{ACC_STEP}
+        if (seg + 1 < s_hi) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+{OUT_BLOCK}
+"""
+
+
+@functools.lru_cache(maxsize=32)
+def _pair_sum_kernel(N: int, detrend: bool, trio: bool):
+    M = N // 2
+    S = int(math.log2(M))
+    T = min(256, max(32, M // 2))
+    kmax = -(-(M + 1) // T)
+    fft = _PAIR_FFT.format(M=M, S=S, T=T)
+    acc_decl = (_PAIR_SUM_DECL_TRIO if trio else _PAIR_SUM_DECL_CSD).format(KMAX=kmax)
+    acc_step = (_PAIR_SUM_STEP_TRIO if trio else _PAIR_SUM_STEP_CSD).format(
+        M=M, T=T, KMAX=kmax
+    )
+    out = (_PAIR_SUM_OUT_TRIO if trio else _PAIR_SUM_OUT_CSD).format(
+        M=M, T=T, KMAX=kmax
+    )
+    src = _PAIR_SUM_SRC.format(
+        M=M, T=T, KMAX=kmax, FFT=fft,
+        RED_DECL=f"    threadgroup float red[{T}];" if detrend else "",
+        LOAD_X=_pair_load("xseg", N, M, T, detrend),
+        LOAD_Y=_pair_load("yseg", N, M, T, detrend),
+        ACC_DECL=acc_decl,
+        ACC_STEP=acc_step,
+        OUT_BLOCK=out,
+    )
+    kern = mx.fast.metal_kernel(
+        name=f"mlx_signal_processing_csd_sum_{N}_{int(detrend)}_{int(trio)}",
+        input_names=["xa", "xb", "tw", "ut", "win", "params"],
+        output_names=["pxx", "pyy", "pxy"] if trio else ["out"],
+        source=src,
+        header=_HEADER.format(M=M),
+    )
+    return kern, T, M
+
+
+def _pair_sum_launch(x, y, win, nperseg, hop, detrend, trio):
+    n = x.shape[-1]
+    nseg = (n - nperseg) // hop + 1
+    batch_shape = x.shape[:-1]
+    x2 = x.reshape(-1, n)
+    y2 = y.reshape(-1, n)
+    B = x2.shape[0]
+    group_size, ngroups = _group_params(B, nseg)
+    total_grps = B * ngroups
+
+    do_detrend = detrend in ("constant", "c")
+    kern, T, M = _pair_sum_kernel(nperseg, do_detrend, trio)
+    tw, ut = _tables(nperseg)
+    params = mx.array([n, hop, nseg, ngroups, group_size, total_grps], dtype=mx.int32)
+
+    if trio:
+        shapes = [(total_grps, M + 1), (total_grps, M + 1), (total_grps, 2 * (M + 1))]
+        dtypes = [mx.float32, mx.float32, mx.float32]
+    else:
+        shapes = [(total_grps, 2 * (M + 1))]
+        dtypes = [mx.float32]
+    outs = kern(
+        inputs=[x2, y2, tw, ut, win, params],
+        grid=(T, total_grps, 1),
+        threadgroup=(T, 1, 1),
+        output_shapes=shapes,
+        output_dtypes=dtypes,
+    )
+    if trio:
+        pxx = _reduce_groups(outs[0], batch_shape, ngroups, M + 1, nseg, is_complex=False)
+        pyy = _reduce_groups(outs[1], batch_shape, ngroups, M + 1, nseg, is_complex=False)
+        pxy = _reduce_groups(outs[2], batch_shape, ngroups, 2 * (M + 1), nseg, is_complex=True)
+        return pxx, pyy, pxy
+    return _reduce_groups(outs[0], batch_shape, ngroups, 2 * (M + 1), nseg, is_complex=True)
+
+
+def csd_mean(x, y, win, nperseg, hop, detrend):
+    """Mean conj(F(x_seg)) * F(y_seg) over segments, accumulated in groups."""
+    return _pair_sum_launch(x, y, win, nperseg, hop, detrend, trio=False)
+
+
+def coherence_mean(x, y, win, nperseg, hop, detrend):
+    """Mean (|Fx|^2, |Fy|^2, conj(Fx)*Fy) over segments, accumulated in groups."""
+    return _pair_sum_launch(x, y, win, nperseg, hop, detrend, trio=True)
+
+
+# ---------------------------------------------------------------------------
 # inverse: per-segment inverse rfft + windowing, then gather-based overlap-add
 # ---------------------------------------------------------------------------
 

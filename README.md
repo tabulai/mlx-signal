@@ -43,7 +43,7 @@ python -m pytest -q         # optional: run the SciPy parity suite
 
 ## Measured performance
 
-Measured on an Apple M4 Max (macOS 26.2) with MLX 0.32.2, SciPy 1.18.1, and
+Measured on an Apple M4 Max (macOS 26.6.2) with MLX 0.32.2, SciPy 1.18.1, and
 float32 data. Every result passed a SciPy correctness check before timing.
 Values are medians of 9 runs after 3 warmups:
 
@@ -57,39 +57,45 @@ or reproduce it with
 
 | function | shape | scipy | mlx-signal (e2e) | mlx-signal (device) | speedup (e2e / device) |
 |---|---|---:|---:|---:|---:|
-| welch | 64ch × 2^20, nperseg=1024 | 501.97 ms | 8.57 ms | 4.26 ms | **58.6x / 117.7x** |
-| welch | 1ch × 2^22, nperseg=4096 | 49.52 ms | 1.83 ms | 0.58 ms | **27.1x / 85.7x** |
-| welch | 256ch × 2^16, nperseg=256 | 117.02 ms | 2.23 ms | 1.09 ms | **52.5x / 107.7x** |
-| csd | 64ch × 2^20, nperseg=1024 | 993.43 ms | 16.65 ms | 9.00 ms | **59.7x / 110.4x** |
-| coherence | 64ch × 2^20, nperseg=1024 | 2040.15 ms | 19.19 ms | 10.67 ms | **106.3x / 191.2x** |
-| spectrogram | 16ch × 2^20 | 69.37 ms | 3.59 ms | 1.29 ms | **19.3x / 53.6x** |
-| stft | 16ch × 2^20, nperseg=1024 | 81.42 ms | 4.57 ms | 1.25 ms | **17.8x / 65.4x** |
-| istft | 16ch × 2^20, nperseg=1024 | 189.38 ms | 18.92 ms | 1.46 ms | **10.0x / 129.3x** |
-| fftconvolve | 2^20 × 4097 | 11.25 ms | 1.56 ms | 0.56 ms | **7.2x / 20.3x** |
-| fftconvolve | 2^22 × 257 | 48.82 ms | 1.21 ms | 0.70 ms | **40.3x / 69.7x** |
-| fftconvolve (pair) | 2^20 × 2^20 | 22.30 ms | 1.35 ms | 0.89 ms | **16.6x / 25.0x** |
-| oaconvolve | 2^23 × 513 | 27.31 ms | 2.46 ms | 1.26 ms | **11.1x / 21.7x** |
-| correlate (batched) | 64ch × 2^18, 4096 taps | 66.98 ms | 7.44 ms | 5.05 ms | **9.0x / 13.3x** |
-| correlate (auto) | 2^20 autocorrelation | 22.78 ms | 1.69 ms | 0.56 ms | **13.5x / 40.8x** |
-| resample_poly | 16ch, 48k→44.1k (147/160) | 124.10 ms | 3.55 ms | 1.07 ms | **35.0x / 116.4x** |
-| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 312.98 ms | 3.90 ms | 2.48 ms | **80.3x / 126.0x** |
-| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 186.36 ms | 3.79 ms | 1.41 ms | **49.2x / 132.4x** |
-| resample (FFT) | 2^20 → 2^18 | 4.40 ms | 0.90 ms | 0.70 ms | **4.9x / 6.3x** |
-| hilbert | 2^20 | 8.91 ms | 1.33 ms | 0.42 ms | **6.7x / 21.4x** |
-| lfilter (FIR) | 64ch × 2^20, 257 taps | 1648.00 ms | 13.95 ms | 5.89 ms | **118.1x / 279.8x** |
-| lfilter (IIR) | 256ch × 2^20, butter-4 tf | 1668.50 ms | 44.49 ms | 13.00 ms | **37.5x / 128.3x** |
-| lfilter (IIR, single channel) | 1ch × 2^22, butter-4 tf | 24.59 ms | 1.54 ms | 0.93 ms | **16.0x / 26.6x** |
-| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1350.96 ms | 44.35 ms | 12.70 ms | **30.5x / 106.4x** |
-| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 21.01 ms | 1.97 ms | 1.35 ms | **10.7x / 15.6x** |
-| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2778.62 ms | 130.65 ms | 44.64 ms | **21.3x / 62.2x** |
-| filtfilt (IIR) | 256ch × 2^20, butter-4 tf | 3304.42 ms | 131.38 ms | 45.64 ms | **25.2x / 72.4x** |
-| filtfilt (FIR) | 64ch × 2^20, 257 taps | 3313.02 ms | 36.97 ms | 15.45 ms | **89.6x / 214.5x** |
-| resample (FFT) >1M samples¹ | 2^23 → ×0.75 | 68.71 ms | 3.61 ms | 2.77 ms | **19.0x / 24.8x** |
-| hilbert >1M samples¹ | 2^23 | 97.80 ms | 4.20 ms | 2.69 ms | **23.3x / 36.3x** |
-| find_peaks | 2^23, prominence=1 | 227.18 ms | 92.43 ms | — | **2.5x**² |
-| peak_prominences | 2^23, 2.8M peaks | 170.93 ms | 20.92 ms | — | **8.2x**² |
+| welch | 64ch × 2^20, nperseg=1024 | 484.46 ms | 7.92 ms | 3.63 ms | **61.1x / 133.3x** |
+| welch | 1ch × 2^22, nperseg=4096 | 46.17 ms | 2.00 ms | 0.65 ms | **23.0x / 71.3x** |
+| welch | 256ch × 2^16, nperseg=256 | 112.58 ms | 2.60 ms | 0.98 ms | **43.4x / 114.5x** |
+| csd | 64ch × 2^20, nperseg=1024 | 952.09 ms | 16.17 ms | 7.68 ms | **58.9x / 124.0x** |
+| coherence | 64ch × 2^20, nperseg=1024 | 1972.20 ms | 16.78 ms | 8.40 ms | **117.5x / 234.9x** |
+| spectrogram | 16ch × 2^20 | 67.84 ms | 3.72 ms | 1.31 ms | **18.2x / 51.6x** |
+| stft | 16ch × 2^20, nperseg=1024 | 79.10 ms | 4.62 ms | 1.25 ms | **17.1x / 63.4x** |
+| istft | 16ch × 2^20, nperseg=1024 | 180.41 ms | 5.31 ms | 1.50 ms | **34.0x / 120.5x** |
+| fftconvolve | 2^20 × 4097 | 11.22 ms | 1.82 ms | 1.34 ms | **6.2x / 8.4x** |
+| fftconvolve | 2^22 × 257 | 49.18 ms | 2.92 ms | 0.74 ms | **16.8x / 66.3x** |
+| fftconvolve (pair) | 2^20 × 2^20 | 23.05 ms | 1.54 ms | 1.18 ms | **15.0x / 19.5x** |
+| oaconvolve | 2^23 × 513 | 27.36 ms | 2.93 ms | 1.30 ms | **9.3x / 21.0x** |
+| correlate (batched) | 64ch × 2^18, 4096 taps | 65.21 ms | 7.47 ms | 5.04 ms | **8.7x / 12.9x** |
+| correlate (auto) | 2^20 autocorrelation | 23.33 ms | 1.57 ms | 0.54 ms | **14.9x / 43.1x** |
+| resample_poly | 16ch, 48k→44.1k (147/160) | 120.68 ms | 3.21 ms | 0.92 ms | **37.6x / 130.7x** |
+| upfirdn | 64ch × 2^18, up=2 down=3, 255 taps | 302.12 ms | 4.28 ms | 2.65 ms | **70.6x / 114.2x** |
+| upfirdn (complex IQ) | 16ch × 2^20 c64, down=10, 201 taps | 181.73 ms | 3.64 ms | 1.57 ms | **49.9x / 116.0x** |
+| resample (FFT) | 2^20 → 2^18 | 4.36 ms | 0.84 ms | 0.74 ms | **5.2x / 5.9x** |
+| hilbert | 2^20 | 8.46 ms | 1.32 ms | 0.44 ms | **6.4x / 19.4x** |
+| lfilter (FIR)¹ | 64ch × 2^20, 257 taps | 1636.53 ms | 13.27 ms | 4.97 ms | **123.4x / 329.3x** |
+| lfilter (FIR, f32 a)¹ | 64ch × 2^20, 257 taps, f32 | 984.72 ms | 13.54 ms | 5.36 ms | **72.7x / 183.8x** |
+| lfilter (IIR) | 256ch × 2^20, butter-4 tf | 1672.30 ms | 45.98 ms | 12.31 ms | **36.4x / 135.9x** |
+| lfilter (IIR, single channel) | 1ch × 2^22, butter-4 tf | 27.09 ms | 2.09 ms | 0.92 ms | **12.9x / 29.3x** |
+| sosfilt (IIR) | 256ch × 2^20, butter-8 | 1378.86 ms | 45.83 ms | 12.75 ms | **30.1x / 108.2x** |
+| sosfilt (IIR, single channel) | 1ch × 2^22, butter-8 | 21.53 ms | 2.34 ms | 1.96 ms | **9.2x / 11.0x** |
+| sosfiltfilt (IIR) | 256ch × 2^20, butter-8 | 2817.45 ms | 127.72 ms | 41.88 ms | **22.1x / 67.3x** |
+| filtfilt (IIR) | 256ch × 2^20, butter-4 tf | 3718.35 ms | 127.25 ms | 42.16 ms | **29.2x / 88.2x** |
+| filtfilt (FIR)¹ | 64ch × 2^20, 257 taps | 3289.11 ms | 35.66 ms | 14.09 ms | **92.2x / 233.5x** |
+| filtfilt (FIR, f32 a)¹ | 64ch × 2^20, 257 taps, f32 | 2004.95 ms | 36.22 ms | 13.95 ms | **55.4x / 143.7x** |
+| resample (FFT) >1M samples² | 2^23 → ×0.75 | 68.10 ms | 4.01 ms | 2.91 ms | **17.0x / 23.4x** |
+| hilbert >1M samples² | 2^23 | 96.92 ms | 4.71 ms | 2.92 ms | **20.6x / 33.1x** |
+| find_peaks | 2^23, prominence=1 | 235.35 ms | 21.05 ms | — | **11.2x**³ |
+| peak_prominences | 2^23, 2.8M peaks | 162.48 ms | 16.26 ms | — | **10.0x**³ |
 
-¹ MLX 0.32's Metal FFT fails at some lengths above 2^20. mlx-signal handles
+¹ Passing a Python float denominator (`a=[1.0]`) promotes SciPy's FIR path to
+float64 even for float32 signals and taps; the `f32 a` rows pass
+`np.array([1.0], dtype=np.float32)` for a matched-precision baseline.
+
+² MLX 0.32's Metal FFT fails at some lengths above 2^20. mlx-signal handles
 them with its own four-step (Bailey) GPU decomposition. Power-of-two lengths
 from 2^21 through 2^26 use three fused Metal passes: about 2x faster than the
 composed path at 2^23 and 5x at 2^26, with better accuracy than MLX's large
@@ -97,9 +103,9 @@ FFT. Other factorable lengths use safe-size sub-FFTs; only lengths without a
 safe factorization, such as large primes, use the CPU stream. See
 [Known limitations](#known-limitations).
 
-² The expensive prominence search in `find_peaks` runs on the GPU and matches
-SciPy bit for bit. Index bookkeeping stays on the host, limiting the overall
-speedup to about 2.5x.
+³ Local-maxima detection and prominence search in `find_peaks` run on the GPU
+and match SciPy bit for bit; remaining condition filtering and index
+bookkeeping stay on the host.
 
 ## Comparison with other libraries
 
@@ -166,7 +172,7 @@ chunks. Transfer-function filters are supported through order 16.
 
 Long signals use a block-parallel scan; shorter jobs use a sequential kernel
 when worthwhile, then fall back to SciPy. In the table above, transfer-function
-filtering reaches 128x at 256 channels and 27x for a single channel on-device.
+filtering reaches 136x at 256 channels and 29x for a single channel on-device.
 The sequential path is bit-identical to matching SciPy float32 builds. The
 parallel path typically matches to about 1e-6, with roughly 1e-5 worst-case
 error for resonant filters near its routing threshold.

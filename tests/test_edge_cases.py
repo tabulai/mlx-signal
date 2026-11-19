@@ -374,3 +374,14 @@ def test_byte_budget_cache_hard_bound():
     c.put(("a",), 1, 60)
     c.put(("b",), 2, 60)
     assert c._total <= 100
+
+    c2 = ByteBudgetCache(1000, max_entries=2)
+    c2.put(("a",), 1, 10)
+    c2.put(("b",), 2, 10)
+    assert c2.get(("a",)) == 1  # refreshes "a" as MRU
+    c2.put(("c",), 3, 10)
+    assert len(c2._entries) == 2
+    assert c2.get(("b",)) is None
+    assert c2.get(("a",)) == 1 and c2.get(("c",)) == 3
+    c2.clear()
+    assert len(c2._entries) == 0 and c2._total == 0
